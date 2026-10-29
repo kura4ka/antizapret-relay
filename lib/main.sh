@@ -9,7 +9,7 @@ Download install.sh to both servers, then run as root:
   # On Server 2:
   bash install.sh server --endpoint SERVER2_PUBLIC_IPV4 [--port 51888] [--uplink eth0]
   # On Server 1, after copying the bundle from Server 2:
-  bash install.sh client --bundle /root/antizapret-relay-import.json --domain example.com
+  bash install.sh client --bundle /root/antizapret-relay-import.json
 
 Donor creates /root/antizapret-relay-donor.json (SECRET). Copy it privately to
 the client as /root/antizapret-relay-import.json. Never publish private keys.
@@ -17,15 +17,25 @@ Client replaces WARP peers for both AntiZapret and full VPN custom-domain mode.
 Use --antizapret-only to leave the full VPN WARP peer unchanged. DNS WARP stays
 unchanged. Existing shared WARP include/exclude lists continue to apply.
 
+Manage domains ON THE CLIENT VPS using the native AntiZapret files:
+  /root/antizapret/config/include-warp-hosts.txt  # send through donor
+  /root/antizapret/config/exclude-warp-hosts.txt  # exclude from donor route
+One domain per line, without https://, paths or *. Subdomains are included.
+After editing either file, apply changes on the client:
+  /root/antizapret/parse.sh
+
 After installation:
-  antizapret-relay domain add example.com
-  antizapret-relay domain remove example.com
-  antizapret-relay domain list
   antizapret-relay status
   antizapret-relay uninstall
   antizapret-relay uninstall --role client
   antizapret-relay uninstall --role server
   antizapret-relay uninstall --role all
+
+Optional domain helpers manage config/relay-include-warp-hosts.txt only.
+Native exclusions also apply; list shows only this additional file:
+  antizapret-relay domain add example.com
+  antizapret-relay domain remove example.com
+  antizapret-relay domain list
 
 Upgrade an existing installation without restarting its tunnels:
   bash install.sh upgrade

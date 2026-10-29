@@ -96,7 +96,8 @@ PY
     rm -rf -- "$stage"
     log 'Installed. Native WARP domain lists now use your exit VPS.'
     log 'Run: antizapret-relay status'
-    log 'For a site: antizapret-relay domain add example.com'
+    log 'On this client VPS, edit /root/antizapret/config/include-warp-hosts.txt and exclude-warp-hosts.txt.'
+    log 'After editing the native lists, run: /root/antizapret/parse.sh'
     log 'Delete the imported client JSON from the source and destination after you have backed it up securely.'
 }
 
