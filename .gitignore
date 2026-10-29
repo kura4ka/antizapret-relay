@@ -1,0 +1,8 @@
+upstream/
+__pycache__/
+*.pyc
+*.json
+!tests/fixtures/*.json
+*.key
+*.conf
+dist/
