@@ -111,6 +111,9 @@ wizard_done() {
     fi
     if [[ -f $STATE_DIR/client.conf ]]; then
         log 'CLIENT: installed. Manage domains ON THIS CLIENT VPS:'
+        if [[ -f $STATE_DIR/default-exclusions.json ]]; then
+            log 'Bundled WARP defaults are excluded in the marked block of exclude-warp-hosts.txt.'
+        fi
     else
         log 'CLIENT: not installed here. Manage domains ON THE CLIENT VPS after connecting it:'
     fi

@@ -21,6 +21,9 @@ the client as /root/antizapret-relay-import.json. Never publish private keys.
 Client replaces WARP peers for both AntiZapret and full VPN custom-domain mode.
 Use --antizapret-only to leave the full VPN WARP peer unchanged. DNS WARP stays
 unchanged. Existing shared WARP include/exclude lists continue to apply.
+Installation adds the bundled WARP domains to a marked block in the native
+exclude-warp-hosts.txt. To opt one back in, remove its matching exclusions,
+add it to include-warp-hosts.txt, then run parse.sh.
 
 Manage domains ON THE CLIENT VPS using the native AntiZapret files:
   /root/antizapret/config/include-warp-hosts.txt  # send through donor
@@ -42,7 +45,8 @@ Native exclusions also apply; list shows only this additional file:
   antizapret-relay domain remove example.com
   antizapret-relay domain list
 
-Upgrade an existing installation without restarting its tunnels:
+Upgrade an existing installation (first default-exclusion migration briefly
+reconnects WARP; keys and addresses are preserved):
   bash install.sh upgrade
 HELP
 }
@@ -128,6 +132,7 @@ relay_main() {
             [[ -f $STATE_DIR/client.conf || -f $STATE_DIR/server.conf ]] || die 'Install a role first.'
             install_dependencies
             install_self
+            client_upgrade_exclusions
             log 'Installer and firewall hooks upgraded. Existing keys and tunnel addresses are kept.'
             ;;
         *) usage >&2; die "Unknown command: $command_name" ;;

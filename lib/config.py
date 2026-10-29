@@ -382,6 +382,174 @@ def domains(operation, path, value=None):
     return []
 
 
+EXCLUSIONS_BEGIN = '# BEGIN ANTIZAPRET RELAY DEFAULT WARP EXCLUSIONS'
+EXCLUSIONS_END = '# END ANTIZAPRET RELAY DEFAULT WARP EXCLUSIONS'
+_NATIVE_DOMAIN_CUT = set("]_~:/?#[@!$&'()*+,;=")
+
+
+def _native_warp_entries(text, strict=True):
+    """Read the host-list syntax used by upstream parse.sh, without evaluating it."""
+    result = set()
+    for line in text.splitlines():
+        value = re.sub(r'[\r \t\v\f]+', '', line)
+        if value == '.':
+            if strict:
+                raise ConfigError('A bundled catch-all WARP rule cannot be excluded by the native exclude parser.')
+            continue
+        if not value or not value[0].isalnum():
+            continue
+        value = value[:next((i for i, char in enumerate(value) if char in _NATIVE_DOMAIN_CUT), len(value))].lower()
+        if value.endswith('.'):
+            value = value[:-1]
+        labels = value.split('.')
+        if not value or len(value) > 253 or any(
+            not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label)
+            for label in labels
+        ) or labels[-1].isdigit():
+            if strict:
+                raise ConfigError('Invalid domain in the bundled WARP defaults.')
+            continue
+        result.add(value)
+    return result
+
+
+def _exclusion_file(path):
+    path = Path(path)
+    if path.is_symlink():
+        raise ConfigError('Refusing to change an exclusion-list symbolic link.')
+    if not path.exists():
+        return False, '', 0o600
+    try:
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+            raise ConfigError('Exclusion input must be a regular file smaller than 1 MiB.')
+        text = path.read_bytes().decode('utf-8')
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError('Cannot read the native exclusion list.') from exc
+    if '\x00' in text:
+        raise ConfigError('Invalid exclusion list.')
+    return True, text, stat.S_IMODE(metadata.st_mode)
+
+
+def _render_default_exclusions(original, added):
+    if not added:
+        return original
+    separator = '' if not original or original.endswith('\n') else '\n'
+    return original + separator + EXCLUSIONS_BEGIN + '\n' + ''.join(domain + '\n' for domain in added) + EXCLUSIONS_END + '\n'
+
+
+def prepare_default_exclusions(download_dir, target_path, output_path, metadata_path):
+    """Stage the exclusion change and an exact snapshot before altering a live file."""
+    paths = [Path(path) for path in (target_path, output_path, metadata_path)]
+    if len({str(path.resolve()) for path in paths}) != len(paths):
+        raise ConfigError('Exclusion target, staged output and backup must be distinct files.')
+    for path in paths:
+        if path.is_symlink():
+            raise ConfigError('Refusing exclusion staging through a symbolic link.')
+    if any(path.exists() for path in paths[1:]):
+        raise ConfigError('Exclusion staging output or backup already exists.')
+    default_files = sorted(Path(download_dir).glob('*include-warp-hosts.txt'))
+    if not default_files:
+        raise ConfigError('Bundled WARP include files are missing; exclusions were not changed.')
+    if {str(path.resolve()) for path in default_files}.intersection(str(path.resolve()) for path in paths):
+        raise ConfigError('Bundled input files cannot be used as exclusion staging targets.')
+    defaults = set()
+    for path in default_files:
+        exists, text, _ = _exclusion_file(path)
+        if not exists:
+            raise ConfigError('A bundled WARP include file disappeared.')
+        defaults.update(_native_warp_entries(text))
+    exists, original, mode = _exclusion_file(target_path)
+    if mode > 0o777:
+        raise ConfigError('Exclusion lists with special permission bits require manual review.')
+    if EXCLUSIONS_BEGIN in original or EXCLUSIONS_END in original:
+        raise ConfigError('A relay default-exclusion block already exists; preserve it before applying again.')
+    added = sorted(defaults - _native_warp_entries(original, strict=False))
+    metadata = {'version': 1, 'target': str(Path(target_path).resolve()),
+                'existed': exists, 'original': original, 'mode': mode, 'added': added}
+    serialized = json.dumps(metadata, ensure_ascii=True, indent=2) + '\n'
+    if len(serialized.encode('utf-8')) > 1024 * 1024:
+        raise ConfigError('Exclusion backup is too large.')
+    atomic_write(metadata_path, serialized)
+    try:
+        atomic_write(output_path, _render_default_exclusions(original, added), mode=mode)
+    except Exception:
+        Path(metadata_path).unlink()
+        raise
+
+
+def _default_exclusion_metadata(target_path, metadata_path):
+    if Path(metadata_path).is_symlink():
+        raise ConfigError('Refusing a symbolic-link exclusion backup.')
+    metadata = read_json(metadata_path)
+    fields = {'version', 'target', 'existed', 'original', 'mode', 'added'}
+    if not isinstance(metadata, dict) or set(metadata) != fields or type(metadata['version']) is not int or metadata['version'] != 1:
+        raise ConfigError('Invalid default-exclusion backup.')
+    if metadata['target'] != str(Path(target_path).resolve()) or type(metadata['existed']) is not bool:
+        raise ConfigError('Exclusion backup belongs to another target.')
+    original, mode, added = metadata['original'], metadata['mode'], metadata['added']
+    if not isinstance(original, str) or '\x00' in original or EXCLUSIONS_BEGIN in original or EXCLUSIONS_END in original:
+        raise ConfigError('Invalid original exclusion list in backup.')
+    if type(mode) is not int or not 0 <= mode <= 0o777:
+        raise ConfigError('Invalid original exclusion-list mode.')
+    if not metadata['existed'] and (original or mode != 0o600):
+        raise ConfigError('Invalid snapshot of a missing exclusion file.')
+    if not isinstance(added, list) or any(not isinstance(domain, str) for domain in added):
+        raise ConfigError('Invalid automatically excluded domains.')
+    if added != sorted(set(added)) or any(_native_warp_entries(domain) != {domain} for domain in added):
+        raise ConfigError('Invalid automatically excluded domains.')
+    if set(added).intersection(_native_warp_entries(original, strict=False)):
+        raise ConfigError('Default-exclusion backup claims pre-existing user entries.')
+    return metadata
+
+
+def apply_default_exclusions(target_path, metadata_path):
+    metadata = _default_exclusion_metadata(target_path, metadata_path)
+    exists, current, mode = _exclusion_file(target_path)
+    proposed = _render_default_exclusions(metadata['original'], metadata['added'])
+    expected_exists = metadata['existed'] or bool(metadata['added'])
+    if exists == expected_exists and current == proposed and (not exists or mode == metadata['mode']):
+        return
+    if exists != metadata['existed'] or current != metadata['original'] or exists and mode != metadata['mode']:
+        raise ConfigError('The native exclusion list changed after staging; preserve those changes and retry.')
+    if metadata['added']:
+        atomic_write(target_path, proposed, mode=metadata['mode'])
+
+
+def restore_default_exclusions(target_path, metadata_path, rollback=False, check_only=False):
+    metadata = _default_exclusion_metadata(target_path, metadata_path)
+    exists, current, mode = _exclusion_file(target_path)
+    original = metadata['original']
+    proposed = _render_default_exclusions(original, metadata['added'])
+    exact = current == proposed or current == original
+    if rollback and not exact:
+        raise ConfigError('Exclusion list changed during installation; retain the backup for recovery.')
+    if exact:
+        updated = original
+        delete = not metadata['existed']
+        mode = metadata['mode']
+    else:
+        lines = current.splitlines(keepends=True)
+        begins = [i for i, line in enumerate(lines) if line.rstrip('\r\n') == EXCLUSIONS_BEGIN]
+        ends = [i for i, line in enumerate(lines) if line.rstrip('\r\n') == EXCLUSIONS_END]
+        if not begins and not ends:
+            return  # The user already removed the managed block.
+        if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
+            raise ConfigError('Default-exclusion block markers changed; retain the backup and repair the block first.')
+        start, end = begins[0], ends[0]
+        owned = set(metadata['added'])
+        retained = [line for line in lines[start + 1:end] if line.rstrip('\r\n') not in owned]
+        updated = ''.join(lines[:start] + retained + lines[end + 1:])
+        delete = not metadata['existed'] and not updated
+    if check_only:
+        return
+    if delete:
+        if exists:
+            Path(target_path).unlink()
+    elif not exists or updated != current:
+        atomic_write(target_path, updated, mode=mode)
+
+
 def main(argv):
     try:
         if not argv:
@@ -393,6 +561,16 @@ def main(argv):
             check_routes(*args)
         elif operation == "scope-hooks" and len(args) == 4:
             scope_hooks(*args)
+        elif operation == 'prepare-default-exclusions' and len(args) == 4:
+            prepare_default_exclusions(*args)
+        elif operation == 'apply-default-exclusions' and len(args) == 2:
+            apply_default_exclusions(*args)
+        elif operation == 'restore-default-exclusions' and len(args) == 2:
+            restore_default_exclusions(*args)
+        elif operation == 'rollback-default-exclusions' and len(args) == 2:
+            restore_default_exclusions(*args, rollback=True)
+        elif operation == 'check-default-exclusions' and len(args) == 2:
+            restore_default_exclusions(*args, check_only=True)
         elif operation == "normalize-domain" and len(args) == 1:
             print(normalize_domain(args[0]))
         elif operation == "apply" and len(args) == 3:

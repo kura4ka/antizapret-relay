@@ -2,7 +2,7 @@
 # This file is compiled into install.sh by tools/build.py.
 set -Eeuo pipefail
 umask 077
-VERSION=0.3.0
+VERSION=0.3.1
 STATE_DIR=/etc/antizapret-relay
 APP=/usr/local/sbin/antizapret-relay
 WG_IF=az-relay
@@ -460,6 +460,174 @@ def domains(operation, path, value=None):
     return []
 
 
+EXCLUSIONS_BEGIN = '# BEGIN ANTIZAPRET RELAY DEFAULT WARP EXCLUSIONS'
+EXCLUSIONS_END = '# END ANTIZAPRET RELAY DEFAULT WARP EXCLUSIONS'
+_NATIVE_DOMAIN_CUT = set("]_~:/?#[@!$&'()*+,;=")
+
+
+def _native_warp_entries(text, strict=True):
+    """Read the host-list syntax used by upstream parse.sh, without evaluating it."""
+    result = set()
+    for line in text.splitlines():
+        value = re.sub(r'[\r \t\v\f]+', '', line)
+        if value == '.':
+            if strict:
+                raise ConfigError('A bundled catch-all WARP rule cannot be excluded by the native exclude parser.')
+            continue
+        if not value or not value[0].isalnum():
+            continue
+        value = value[:next((i for i, char in enumerate(value) if char in _NATIVE_DOMAIN_CUT), len(value))].lower()
+        if value.endswith('.'):
+            value = value[:-1]
+        labels = value.split('.')
+        if not value or len(value) > 253 or any(
+            not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label)
+            for label in labels
+        ) or labels[-1].isdigit():
+            if strict:
+                raise ConfigError('Invalid domain in the bundled WARP defaults.')
+            continue
+        result.add(value)
+    return result
+
+
+def _exclusion_file(path):
+    path = Path(path)
+    if path.is_symlink():
+        raise ConfigError('Refusing to change an exclusion-list symbolic link.')
+    if not path.exists():
+        return False, '', 0o600
+    try:
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+            raise ConfigError('Exclusion input must be a regular file smaller than 1 MiB.')
+        text = path.read_bytes().decode('utf-8')
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError('Cannot read the native exclusion list.') from exc
+    if '\x00' in text:
+        raise ConfigError('Invalid exclusion list.')
+    return True, text, stat.S_IMODE(metadata.st_mode)
+
+
+def _render_default_exclusions(original, added):
+    if not added:
+        return original
+    separator = '' if not original or original.endswith('\n') else '\n'
+    return original + separator + EXCLUSIONS_BEGIN + '\n' + ''.join(domain + '\n' for domain in added) + EXCLUSIONS_END + '\n'
+
+
+def prepare_default_exclusions(download_dir, target_path, output_path, metadata_path):
+    """Stage the exclusion change and an exact snapshot before altering a live file."""
+    paths = [Path(path) for path in (target_path, output_path, metadata_path)]
+    if len({str(path.resolve()) for path in paths}) != len(paths):
+        raise ConfigError('Exclusion target, staged output and backup must be distinct files.')
+    for path in paths:
+        if path.is_symlink():
+            raise ConfigError('Refusing exclusion staging through a symbolic link.')
+    if any(path.exists() for path in paths[1:]):
+        raise ConfigError('Exclusion staging output or backup already exists.')
+    default_files = sorted(Path(download_dir).glob('*include-warp-hosts.txt'))
+    if not default_files:
+        raise ConfigError('Bundled WARP include files are missing; exclusions were not changed.')
+    if {str(path.resolve()) for path in default_files}.intersection(str(path.resolve()) for path in paths):
+        raise ConfigError('Bundled input files cannot be used as exclusion staging targets.')
+    defaults = set()
+    for path in default_files:
+        exists, text, _ = _exclusion_file(path)
+        if not exists:
+            raise ConfigError('A bundled WARP include file disappeared.')
+        defaults.update(_native_warp_entries(text))
+    exists, original, mode = _exclusion_file(target_path)
+    if mode > 0o777:
+        raise ConfigError('Exclusion lists with special permission bits require manual review.')
+    if EXCLUSIONS_BEGIN in original or EXCLUSIONS_END in original:
+        raise ConfigError('A relay default-exclusion block already exists; preserve it before applying again.')
+    added = sorted(defaults - _native_warp_entries(original, strict=False))
+    metadata = {'version': 1, 'target': str(Path(target_path).resolve()),
+                'existed': exists, 'original': original, 'mode': mode, 'added': added}
+    serialized = json.dumps(metadata, ensure_ascii=True, indent=2) + '\n'
+    if len(serialized.encode('utf-8')) > 1024 * 1024:
+        raise ConfigError('Exclusion backup is too large.')
+    atomic_write(metadata_path, serialized)
+    try:
+        atomic_write(output_path, _render_default_exclusions(original, added), mode=mode)
+    except Exception:
+        Path(metadata_path).unlink()
+        raise
+
+
+def _default_exclusion_metadata(target_path, metadata_path):
+    if Path(metadata_path).is_symlink():
+        raise ConfigError('Refusing a symbolic-link exclusion backup.')
+    metadata = read_json(metadata_path)
+    fields = {'version', 'target', 'existed', 'original', 'mode', 'added'}
+    if not isinstance(metadata, dict) or set(metadata) != fields or type(metadata['version']) is not int or metadata['version'] != 1:
+        raise ConfigError('Invalid default-exclusion backup.')
+    if metadata['target'] != str(Path(target_path).resolve()) or type(metadata['existed']) is not bool:
+        raise ConfigError('Exclusion backup belongs to another target.')
+    original, mode, added = metadata['original'], metadata['mode'], metadata['added']
+    if not isinstance(original, str) or '\x00' in original or EXCLUSIONS_BEGIN in original or EXCLUSIONS_END in original:
+        raise ConfigError('Invalid original exclusion list in backup.')
+    if type(mode) is not int or not 0 <= mode <= 0o777:
+        raise ConfigError('Invalid original exclusion-list mode.')
+    if not metadata['existed'] and (original or mode != 0o600):
+        raise ConfigError('Invalid snapshot of a missing exclusion file.')
+    if not isinstance(added, list) or any(not isinstance(domain, str) for domain in added):
+        raise ConfigError('Invalid automatically excluded domains.')
+    if added != sorted(set(added)) or any(_native_warp_entries(domain) != {domain} for domain in added):
+        raise ConfigError('Invalid automatically excluded domains.')
+    if set(added).intersection(_native_warp_entries(original, strict=False)):
+        raise ConfigError('Default-exclusion backup claims pre-existing user entries.')
+    return metadata
+
+
+def apply_default_exclusions(target_path, metadata_path):
+    metadata = _default_exclusion_metadata(target_path, metadata_path)
+    exists, current, mode = _exclusion_file(target_path)
+    proposed = _render_default_exclusions(metadata['original'], metadata['added'])
+    expected_exists = metadata['existed'] or bool(metadata['added'])
+    if exists == expected_exists and current == proposed and (not exists or mode == metadata['mode']):
+        return
+    if exists != metadata['existed'] or current != metadata['original'] or exists and mode != metadata['mode']:
+        raise ConfigError('The native exclusion list changed after staging; preserve those changes and retry.')
+    if metadata['added']:
+        atomic_write(target_path, proposed, mode=metadata['mode'])
+
+
+def restore_default_exclusions(target_path, metadata_path, rollback=False, check_only=False):
+    metadata = _default_exclusion_metadata(target_path, metadata_path)
+    exists, current, mode = _exclusion_file(target_path)
+    original = metadata['original']
+    proposed = _render_default_exclusions(original, metadata['added'])
+    exact = current == proposed or current == original
+    if rollback and not exact:
+        raise ConfigError('Exclusion list changed during installation; retain the backup for recovery.')
+    if exact:
+        updated = original
+        delete = not metadata['existed']
+        mode = metadata['mode']
+    else:
+        lines = current.splitlines(keepends=True)
+        begins = [i for i, line in enumerate(lines) if line.rstrip('\r\n') == EXCLUSIONS_BEGIN]
+        ends = [i for i, line in enumerate(lines) if line.rstrip('\r\n') == EXCLUSIONS_END]
+        if not begins and not ends:
+            return  # The user already removed the managed block.
+        if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
+            raise ConfigError('Default-exclusion block markers changed; retain the backup and repair the block first.')
+        start, end = begins[0], ends[0]
+        owned = set(metadata['added'])
+        retained = [line for line in lines[start + 1:end] if line.rstrip('\r\n') not in owned]
+        updated = ''.join(lines[:start] + retained + lines[end + 1:])
+        delete = not metadata['existed'] and not updated
+    if check_only:
+        return
+    if delete:
+        if exists:
+            Path(target_path).unlink()
+    elif not exists or updated != current:
+        atomic_write(target_path, updated, mode=mode)
+
+
 def main(argv):
     try:
         if not argv:
@@ -471,6 +639,16 @@ def main(argv):
             check_routes(*args)
         elif operation == "scope-hooks" and len(args) == 4:
             scope_hooks(*args)
+        elif operation == 'prepare-default-exclusions' and len(args) == 4:
+            prepare_default_exclusions(*args)
+        elif operation == 'apply-default-exclusions' and len(args) == 2:
+            apply_default_exclusions(*args)
+        elif operation == 'restore-default-exclusions' and len(args) == 2:
+            restore_default_exclusions(*args)
+        elif operation == 'rollback-default-exclusions' and len(args) == 2:
+            restore_default_exclusions(*args, rollback=True)
+        elif operation == 'check-default-exclusions' and len(args) == 2:
+            restore_default_exclusions(*args, check_only=True)
         elif operation == "normalize-domain" and len(args) == 1:
             print(normalize_domain(args[0]))
         elif operation == "apply" and len(args) == 3:
@@ -844,6 +1022,7 @@ server_uninstall() {
 
 # Replace the built-in Cloudflare peers, preserving the upstream DNS allocator.
 CLIENT_DOMAINS=/root/antizapret/config/relay-include-warp-hosts.txt
+CLIENT_EXCLUDES=/root/antizapret/config/exclude-warp-hosts.txt
 CLIENT_DROPIN=/etc/systemd/system/antizapret.service.d/90-antizapret-relay-client.conf
 
 client_firewall() {
@@ -886,7 +1065,7 @@ client_install() {
     install_dependencies
     client_compatibility
     [[ ! -e $STATE_DIR/client.conf ]] || die 'Client role already installed. Use status or uninstall --role client before reconfiguring.'
-    [[ ! -e $STATE_DIR/setup.before.json && ! -e $STATE_DIR/setup.snapshot && ! -e $STATE_DIR/client-values.json ]] || die 'Previous installation metadata exists. Preserve and resolve it before installing.'
+    [[ ! -e $STATE_DIR/setup.before.json && ! -e $STATE_DIR/setup.snapshot && ! -e $STATE_DIR/client-values.json && ! -e $STATE_DIR/default-exclusions.json && ! -L $STATE_DIR/default-exclusions.json ]] || die 'Previous installation metadata exists. Preserve and resolve it before installing.'
     [[ ! -e $CLIENT_DOMAINS && ! -e $CLIENT_DROPIN ]] || die 'Reserved relay domain file or systemd drop-in already exists.'
     stage=$(mktemp -d)
     # Validate all imported data before touching the running installation.
@@ -898,6 +1077,12 @@ client_install() {
     for domain in "${domains[@]}"; do
         if ! config_tool domain-add "$stage/domains" "$domain"; then rm -rf -- "$stage"; return 1; fi
     done
+    # Exclude the installed upstream defaults without editing downloaded lists or
+    # overwriting existing user exclusions. Prepare before any live changes.
+    if ! config_tool prepare-default-exclusions "$AZ_DIR/download" "$CLIENT_EXCLUDES" "$stage/exclusions" "$stage/default-exclusions.json"; then
+        rm -rf -- "$stage"
+        return 1
+    fi
     python3 - "$bundle" "$stage/changes.json" "$only" <<'PY'
 import json, sys
 from pathlib import Path
@@ -920,14 +1105,16 @@ PY
     install -m 0600 "$AZ_DIR/setup" "$stage/setup"
     if ! config_tool apply "$stage/setup" "$stage/setup.before.json" "$stage/changes.json"; then rm -rf -- "$stage"; return 1; fi
     install_self
+    trap 'client_install_rollback "$stage"' ERR
     install -m 0600 "$stage/changes.json" "$STATE_DIR/client-values.json"
     printf 'prefix=%q\nonly=%q\n' "$prefix" "$only" > "$STATE_DIR/client.conf"
     install -m 0600 "$AZ_DIR/setup" "$STATE_DIR/setup.snapshot"
-    trap 'client_install_rollback "$stage"' ERR
+    install -m 0600 "$stage/default-exclusions.json" "$STATE_DIR/default-exclusions.json"
     log 'Stopping AntiZapret briefly to remove the old WireGuard routes cleanly.'
     systemctl stop antizapret.service
     # Any failure after this point restores the previous managed settings.
     config_tool apply "$AZ_DIR/setup" "$STATE_DIR/setup.before.json" "$STATE_DIR/client-values.json"
+    config_tool apply-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"
     install -m 0600 "$stage/domains" "$CLIENT_DOMAINS"
     install -d -m 0755 "$(dirname "$CLIENT_DROPIN")"
     printf '[Service]\nExecStartPost=%s firewall up client\n' "$APP" > "$CLIENT_DROPIN"
@@ -939,9 +1126,11 @@ PY
     trap - ERR
     rm -rf -- "$stage"
     log 'Installed. Native WARP domain lists now use your exit VPS.'
+    log 'Bundled WARP defaults were added to the marked block in /root/antizapret/config/exclude-warp-hosts.txt.'
     log 'Run: antizapret-relay status'
     log 'Send domains through the donor: /root/antizapret/config/include-warp-hosts.txt'
     log 'Exclude domains from the donor: /root/antizapret/config/exclude-warp-hosts.txt'
+    log 'To choose a bundled domain later, remove its matching exclusions before applying the lists.'
     log 'After editing the native lists, run: /root/antizapret/parse.sh'
     log 'Keep donor exports private. A manually copied import file may be deleted after a secure backup.'
 }
@@ -957,6 +1146,13 @@ client_install_rollback() {
     elif [[ -f $STATE_DIR/setup.snapshot ]]; then
         install -m 0600 "$STATE_DIR/setup.snapshot" "$AZ_DIR/setup"
     fi
+    if [[ -f $STATE_DIR/default-exclusions.json ]]; then
+        if config_tool rollback-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"; then
+            rm -f -- "$STATE_DIR/default-exclusions.json"
+        else
+            log 'Could not restore domain exclusions; recovery metadata is kept in /etc/antizapret-relay/default-exclusions.json.'
+        fi
+    fi
     rm -f -- "$CLIENT_DROPIN" "$CLIENT_DOMAINS"
     systemctl daemon-reload || true
     systemctl start antizapret.service || true
@@ -969,17 +1165,57 @@ client_uninstall() {
     [[ -f $STATE_DIR/client.conf ]] || return 0
     [[ -f $AZ_DIR/setup && -f $STATE_DIR/setup.before.json ]] || die 'Restore metadata or AntiZapret setup is missing; refusing to discard the backup.'
     config_tool check-restore "$AZ_DIR/setup" "$STATE_DIR/setup.before.json"
+    if [[ -e $STATE_DIR/default-exclusions.json || -L $STATE_DIR/default-exclusions.json ]]; then
+        config_tool check-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"
+    fi
     trap 'trap - ERR; log "Uninstall interrupted; restart AntiZapret and retain the backup for recovery."; systemctl start antizapret.service || true; exit 1' ERR
     systemctl stop antizapret.service
     config_tool restore "$AZ_DIR/setup" "$STATE_DIR/setup.before.json"
+    if [[ -f $STATE_DIR/default-exclusions.json ]]; then
+        config_tool restore-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"
+    fi
     rm -f -- "$CLIENT_DROPIN" "$CLIENT_DOMAINS"
     client_firewall down
     systemctl daemon-reload
     systemctl start antizapret.service
     (cd "$AZ_DIR" && ./parse.sh)
-    rm -f -- "$STATE_DIR/client.conf" "$STATE_DIR/client-values.json" "$STATE_DIR/setup.before.json" "$STATE_DIR/setup.snapshot"
+    rm -f -- "$STATE_DIR/client.conf" "$STATE_DIR/client-values.json" "$STATE_DIR/setup.before.json" "$STATE_DIR/setup.snapshot" "$STATE_DIR/default-exclusions.json"
     trap - ERR
     log 'Previous WARP settings restored; unrelated AntiZapret setup values preserved.'
+}
+
+client_upgrade_exclusions() (
+    # One-time migration. Later upgrades retain deliberate edits to exclusions.
+    [[ -f $STATE_DIR/client.conf ]] || return 0
+    if [[ -e $STATE_DIR/default-exclusions.json || -L $STATE_DIR/default-exclusions.json ]]; then
+        return 0
+    fi
+    client_compatibility
+    local stage
+    stage=$(mktemp -d)
+    trap 'rm -rf -- "$stage"' EXIT
+    config_tool prepare-default-exclusions "$AZ_DIR/download" "$CLIENT_EXCLUDES" "$stage/exclusions" "$stage/default-exclusions.json"
+    trap 'client_upgrade_exclusions_rollback' ERR
+    install -m 0600 "$stage/default-exclusions.json" "$STATE_DIR/default-exclusions.json"
+    config_tool apply-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"
+    # Native parser reloads domain policies and briefly reconnects WARP peers.
+    (cd "$AZ_DIR" && ./parse.sh)
+    trap - ERR
+    log 'Bundled WARP defaults are now excluded in /root/antizapret/config/exclude-warp-hosts.txt.'
+    log 'Later upgrades keep your edits to these exclusions. Keys and tunnel addresses are unchanged.'
+)
+
+client_upgrade_exclusions_rollback() {
+    trap - ERR
+    if [[ -f $STATE_DIR/default-exclusions.json ]]; then
+        if config_tool rollback-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"; then
+            rm -f -- "$STATE_DIR/default-exclusions.json"
+            (cd "$AZ_DIR" && ./parse.sh) || log 'Could not reload the restored lists; rerun /root/antizapret/parse.sh after resolving the error.'
+        else
+            log 'Domain recovery metadata is kept in /etc/antizapret-relay/default-exclusions.json.'
+        fi
+    fi
+    die 'Default-exclusion migration failed. Existing roles and keys are kept; resolve the error and run upgrade again.'
 }
 
 domain_command() {
@@ -1112,6 +1348,9 @@ wizard_done() {
     fi
     if [[ -f $STATE_DIR/client.conf ]]; then
         log 'CLIENT: installed. Manage domains ON THIS CLIENT VPS:'
+        if [[ -f $STATE_DIR/default-exclusions.json ]]; then
+            log 'Bundled WARP defaults are excluded in the marked block of exclude-warp-hosts.txt.'
+        fi
     else
         log 'CLIENT: not installed here. Manage domains ON THE CLIENT VPS after connecting it:'
     fi
@@ -1170,6 +1409,9 @@ the client as /root/antizapret-relay-import.json. Never publish private keys.
 Client replaces WARP peers for both AntiZapret and full VPN custom-domain mode.
 Use --antizapret-only to leave the full VPN WARP peer unchanged. DNS WARP stays
 unchanged. Existing shared WARP include/exclude lists continue to apply.
+Installation adds the bundled WARP domains to a marked block in the native
+exclude-warp-hosts.txt. To opt one back in, remove its matching exclusions,
+add it to include-warp-hosts.txt, then run parse.sh.
 
 Manage domains ON THE CLIENT VPS using the native AntiZapret files:
   /root/antizapret/config/include-warp-hosts.txt  # send through donor
@@ -1191,7 +1433,8 @@ Native exclusions also apply; list shows only this additional file:
   antizapret-relay domain remove example.com
   antizapret-relay domain list
 
-Upgrade an existing installation without restarting its tunnels:
+Upgrade an existing installation (first default-exclusion migration briefly
+reconnects WARP; keys and addresses are preserved):
   bash install.sh upgrade
 HELP
 }
@@ -1277,6 +1520,7 @@ relay_main() {
             [[ -f $STATE_DIR/client.conf || -f $STATE_DIR/server.conf ]] || die 'Install a role first.'
             install_dependencies
             install_self
+            client_upgrade_exclusions
             log 'Installer and firewall hooks upgraded. Existing keys and tunnel addresses are kept.'
             ;;
         *) usage >&2; die "Unknown command: $command_name" ;;

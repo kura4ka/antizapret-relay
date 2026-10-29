@@ -1,5 +1,6 @@
 # Replace the built-in Cloudflare peers, preserving the upstream DNS allocator.
 CLIENT_DOMAINS=/root/antizapret/config/relay-include-warp-hosts.txt
+CLIENT_EXCLUDES=/root/antizapret/config/exclude-warp-hosts.txt
 CLIENT_DROPIN=/etc/systemd/system/antizapret.service.d/90-antizapret-relay-client.conf
 
 client_firewall() {
@@ -42,7 +43,7 @@ client_install() {
     install_dependencies
     client_compatibility
     [[ ! -e $STATE_DIR/client.conf ]] || die 'Client role already installed. Use status or uninstall --role client before reconfiguring.'
-    [[ ! -e $STATE_DIR/setup.before.json && ! -e $STATE_DIR/setup.snapshot && ! -e $STATE_DIR/client-values.json ]] || die 'Previous installation metadata exists. Preserve and resolve it before installing.'
+    [[ ! -e $STATE_DIR/setup.before.json && ! -e $STATE_DIR/setup.snapshot && ! -e $STATE_DIR/client-values.json && ! -e $STATE_DIR/default-exclusions.json && ! -L $STATE_DIR/default-exclusions.json ]] || die 'Previous installation metadata exists. Preserve and resolve it before installing.'
     [[ ! -e $CLIENT_DOMAINS && ! -e $CLIENT_DROPIN ]] || die 'Reserved relay domain file or systemd drop-in already exists.'
     stage=$(mktemp -d)
     # Validate all imported data before touching the running installation.
@@ -54,6 +55,12 @@ client_install() {
     for domain in "${domains[@]}"; do
         if ! config_tool domain-add "$stage/domains" "$domain"; then rm -rf -- "$stage"; return 1; fi
     done
+    # Exclude the installed upstream defaults without editing downloaded lists or
+    # overwriting existing user exclusions. Prepare before any live changes.
+    if ! config_tool prepare-default-exclusions "$AZ_DIR/download" "$CLIENT_EXCLUDES" "$stage/exclusions" "$stage/default-exclusions.json"; then
+        rm -rf -- "$stage"
+        return 1
+    fi
     python3 - "$bundle" "$stage/changes.json" "$only" <<'PY'
 import json, sys
 from pathlib import Path
@@ -76,14 +83,16 @@ PY
     install -m 0600 "$AZ_DIR/setup" "$stage/setup"
     if ! config_tool apply "$stage/setup" "$stage/setup.before.json" "$stage/changes.json"; then rm -rf -- "$stage"; return 1; fi
     install_self
+    trap 'client_install_rollback "$stage"' ERR
     install -m 0600 "$stage/changes.json" "$STATE_DIR/client-values.json"
     printf 'prefix=%q\nonly=%q\n' "$prefix" "$only" > "$STATE_DIR/client.conf"
     install -m 0600 "$AZ_DIR/setup" "$STATE_DIR/setup.snapshot"
-    trap 'client_install_rollback "$stage"' ERR
+    install -m 0600 "$stage/default-exclusions.json" "$STATE_DIR/default-exclusions.json"
     log 'Stopping AntiZapret briefly to remove the old WireGuard routes cleanly.'
     systemctl stop antizapret.service
     # Any failure after this point restores the previous managed settings.
     config_tool apply "$AZ_DIR/setup" "$STATE_DIR/setup.before.json" "$STATE_DIR/client-values.json"
+    config_tool apply-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"
     install -m 0600 "$stage/domains" "$CLIENT_DOMAINS"
     install -d -m 0755 "$(dirname "$CLIENT_DROPIN")"
     printf '[Service]\nExecStartPost=%s firewall up client\n' "$APP" > "$CLIENT_DROPIN"
@@ -95,9 +104,11 @@ PY
     trap - ERR
     rm -rf -- "$stage"
     log 'Installed. Native WARP domain lists now use your exit VPS.'
+    log 'Bundled WARP defaults were added to the marked block in /root/antizapret/config/exclude-warp-hosts.txt.'
     log 'Run: antizapret-relay status'
     log 'Send domains through the donor: /root/antizapret/config/include-warp-hosts.txt'
     log 'Exclude domains from the donor: /root/antizapret/config/exclude-warp-hosts.txt'
+    log 'To choose a bundled domain later, remove its matching exclusions before applying the lists.'
     log 'After editing the native lists, run: /root/antizapret/parse.sh'
     log 'Keep donor exports private. A manually copied import file may be deleted after a secure backup.'
 }
@@ -113,6 +124,13 @@ client_install_rollback() {
     elif [[ -f $STATE_DIR/setup.snapshot ]]; then
         install -m 0600 "$STATE_DIR/setup.snapshot" "$AZ_DIR/setup"
     fi
+    if [[ -f $STATE_DIR/default-exclusions.json ]]; then
+        if config_tool rollback-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"; then
+            rm -f -- "$STATE_DIR/default-exclusions.json"
+        else
+            log 'Could not restore domain exclusions; recovery metadata is kept in /etc/antizapret-relay/default-exclusions.json.'
+        fi
+    fi
     rm -f -- "$CLIENT_DROPIN" "$CLIENT_DOMAINS"
     systemctl daemon-reload || true
     systemctl start antizapret.service || true
@@ -125,17 +143,57 @@ client_uninstall() {
     [[ -f $STATE_DIR/client.conf ]] || return 0
     [[ -f $AZ_DIR/setup && -f $STATE_DIR/setup.before.json ]] || die 'Restore metadata or AntiZapret setup is missing; refusing to discard the backup.'
     config_tool check-restore "$AZ_DIR/setup" "$STATE_DIR/setup.before.json"
+    if [[ -e $STATE_DIR/default-exclusions.json || -L $STATE_DIR/default-exclusions.json ]]; then
+        config_tool check-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"
+    fi
     trap 'trap - ERR; log "Uninstall interrupted; restart AntiZapret and retain the backup for recovery."; systemctl start antizapret.service || true; exit 1' ERR
     systemctl stop antizapret.service
     config_tool restore "$AZ_DIR/setup" "$STATE_DIR/setup.before.json"
+    if [[ -f $STATE_DIR/default-exclusions.json ]]; then
+        config_tool restore-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"
+    fi
     rm -f -- "$CLIENT_DROPIN" "$CLIENT_DOMAINS"
     client_firewall down
     systemctl daemon-reload
     systemctl start antizapret.service
     (cd "$AZ_DIR" && ./parse.sh)
-    rm -f -- "$STATE_DIR/client.conf" "$STATE_DIR/client-values.json" "$STATE_DIR/setup.before.json" "$STATE_DIR/setup.snapshot"
+    rm -f -- "$STATE_DIR/client.conf" "$STATE_DIR/client-values.json" "$STATE_DIR/setup.before.json" "$STATE_DIR/setup.snapshot" "$STATE_DIR/default-exclusions.json"
     trap - ERR
     log 'Previous WARP settings restored; unrelated AntiZapret setup values preserved.'
+}
+
+client_upgrade_exclusions() (
+    # One-time migration. Later upgrades retain deliberate edits to exclusions.
+    [[ -f $STATE_DIR/client.conf ]] || return 0
+    if [[ -e $STATE_DIR/default-exclusions.json || -L $STATE_DIR/default-exclusions.json ]]; then
+        return 0
+    fi
+    client_compatibility
+    local stage
+    stage=$(mktemp -d)
+    trap 'rm -rf -- "$stage"' EXIT
+    config_tool prepare-default-exclusions "$AZ_DIR/download" "$CLIENT_EXCLUDES" "$stage/exclusions" "$stage/default-exclusions.json"
+    trap 'client_upgrade_exclusions_rollback' ERR
+    install -m 0600 "$stage/default-exclusions.json" "$STATE_DIR/default-exclusions.json"
+    config_tool apply-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"
+    # Native parser reloads domain policies and briefly reconnects WARP peers.
+    (cd "$AZ_DIR" && ./parse.sh)
+    trap - ERR
+    log 'Bundled WARP defaults are now excluded in /root/antizapret/config/exclude-warp-hosts.txt.'
+    log 'Later upgrades keep your edits to these exclusions. Keys and tunnel addresses are unchanged.'
+)
+
+client_upgrade_exclusions_rollback() {
+    trap - ERR
+    if [[ -f $STATE_DIR/default-exclusions.json ]]; then
+        if config_tool rollback-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"; then
+            rm -f -- "$STATE_DIR/default-exclusions.json"
+            (cd "$AZ_DIR" && ./parse.sh) || log 'Could not reload the restored lists; rerun /root/antizapret/parse.sh after resolving the error.'
+        else
+            log 'Domain recovery metadata is kept in /etc/antizapret-relay/default-exclusions.json.'
+        fi
+    fi
+    die 'Default-exclusion migration failed. Existing roles and keys are kept; resolve the error and run upgrade again.'
 }
 
 domain_command() {
