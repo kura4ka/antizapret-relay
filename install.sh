@@ -2,7 +2,7 @@
 # This file is compiled into install.sh by tools/build.py.
 set -Eeuo pipefail
 umask 077
-VERSION=0.1.0
+VERSION=0.2.0
 STATE_DIR=/etc/antizapret-relay
 APP=/usr/local/sbin/antizapret-relay
 WG_IF=az-relay
@@ -56,6 +56,10 @@ install_self() {
         install -m 0755 "$SCRIPT_FILE" "$APP"
     fi
     install -d -m 0700 "$STATE_DIR"
+    # Older installations called firewall for both roles from each hook. Scope
+    # those hooks before a second role is added, without restarting tunnels.
+    config_tool scope-hooks "$STATE_DIR" "$WG_CONF" "$APP" /etc/systemd/system/antizapret.service.d
+    systemctl daemon-reload
 }
 ipt_add() {
     local table=$1 chain=$2; shift 2
@@ -79,6 +83,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -252,16 +257,16 @@ def _read_lines(path):
     return text.splitlines(keepends=True)
 
 
-def atomic_write(path, content):
+def atomic_write(path, content, mode=0o600):
     path = Path(path)
     if path.is_symlink():
         raise ConfigError("Refusing to replace a symbolic link.")
     temporary = None
     try:
         descriptor, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            os.chmod(temporary, 0o600)
-            handle.write(content)
+        with os.fdopen(descriptor, "wb") as handle:
+            os.chmod(temporary, mode)
+            handle.write(content.encode("utf-8") if isinstance(content, str) else content)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -270,6 +275,63 @@ def atomic_write(path, content):
     finally:
         if temporary and os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _require_root_owned_regular(path):
+    try:
+        metadata = Path(path).lstat()
+    except OSError as exc:
+        raise ConfigError("Cannot inspect local role configuration.") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ConfigError("Refusing to migrate a symbolic link.")
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0:
+        raise ConfigError("Role configuration must be a root-owned regular file.")
+    return metadata
+
+
+def scope_hooks(state_dir, wg_conf, app, dropin_dir):
+    """Migrate only exact installer-owned legacy hooks, without restarting services."""
+    if not app.startswith("/") or any(character in app for character in ("\r", "\n", "\x00")):
+        raise ConfigError("Invalid installed application path.")
+    state_dir, dropin_dir = Path(state_dir), Path(dropin_dir)
+    candidates = []
+    if (state_dir / "server.conf").exists() or (state_dir / "server.conf").is_symlink():
+        _require_root_owned_regular(state_dir / "server.conf")
+        candidates.extend((
+            (Path(wg_conf), {
+                f"PostUp = {app} firewall up": f"PostUp = {app} firewall up server",
+                f"PostDown = {app} firewall down": f"PostDown = {app} firewall down server",
+            }),
+            (dropin_dir / "90-antizapret-relay-server.conf", {
+                f"ExecStartPost=-{app} firewall up": f"ExecStartPost=-{app} firewall up server",
+                f"ExecStartPost={app} firewall up": f"ExecStartPost={app} firewall up server",
+            }),
+        ))
+    if (state_dir / "client.conf").exists() or (state_dir / "client.conf").is_symlink():
+        _require_root_owned_regular(state_dir / "client.conf")
+        candidates.append((dropin_dir / "90-antizapret-relay-client.conf", {
+            f"ExecStartPost={app} firewall up": f"ExecStartPost={app} firewall up client",
+        }))
+    updates = []
+    for path, substitutions in candidates:
+        if not path.exists() and not path.is_symlink():
+            continue
+        metadata = _require_root_owned_regular(path)
+        try:
+            original = path.read_bytes()
+        except OSError as exc:
+            raise ConfigError("Cannot read local role configuration.") from exc
+        replacements = {old.encode("utf-8"): new.encode("utf-8") for old, new in substitutions.items()}
+        lines = []
+        for line in original.splitlines(keepends=True):
+            body = line.rstrip(b"\r\n")
+            lines.append(replacements.get(body, body) + line[len(body):])
+        migrated = b"".join(lines)
+        if migrated != original:
+            updates.append((path, migrated, stat.S_IMODE(metadata.st_mode)))
+    # Validate every target before the first write, especially symlink targets.
+    for path, content, mode in updates:
+        atomic_write(path, content, mode=mode)
 
 
 def _assignments(lines, names):
@@ -407,6 +469,8 @@ def main(argv):
             print("\n".join(validate_bundle(args[0])))
         elif operation == "check-routes" and len(args) == 2:
             check_routes(*args)
+        elif operation == "scope-hooks" and len(args) == 4:
+            scope_hooks(*args)
         elif operation == "normalize-domain" and len(args) == 1:
             print(normalize_domain(args[0]))
         elif operation == "apply" and len(args) == 3:
@@ -434,7 +498,8 @@ AZ_RELAY_CONFIG_PY
 }
 
 
-# German exit server. This file is concatenated into install.sh by build.py.
+# Exit VPS (Server 2). This file is concatenated into install.sh by build.py.
+SERVER_BUNDLE=/root/antizapret-relay-donor.json
 
 server_load_state() {
     [[ -f "$STATE_DIR/server.conf" && ! -L "$STATE_DIR/server.conf" ]] || die 'Exit server is not installed.'
@@ -567,10 +632,54 @@ print(subnet.network_address + 3)
 PY
 }
 
+server_choose_subnet() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import hashlib
+import ipaddress
+import json
+import sys
+
+try:
+    endpoint = ipaddress.IPv4Address(sys.argv[1])
+    port = int(sys.argv[2], 10)
+    if not endpoint.is_global or endpoint.is_multicast or not 1024 <= port <= 65535:
+        raise ValueError()
+    inventory = json.loads(sys.argv[3])
+    if not isinstance(inventory, list):
+        raise ValueError()
+    occupied = []
+    for route in inventory:
+        if not isinstance(route, dict):
+            raise ValueError()
+        destination = route.get('dst', 'default')
+        if destination == 'default':
+            continue
+        network = ipaddress.IPv4Network(destination, strict=False)
+        # A default route is the Internet uplink, not an occupied private range.
+        if network.prefixlen:
+            occupied.append(network)
+except (ValueError, TypeError):
+    sys.exit('Cannot choose a transit subnet from the local routing inventory.')
+
+pool = ipaddress.IPv4Network('10.64.0.0/10')
+count = 1 << (24 - pool.prefixlen)
+seed = hashlib.sha256((str(endpoint) + ':' + str(port)).encode('ascii')).digest()
+first = int.from_bytes(seed, 'big') % count
+base = int(pool.network_address)
+for offset in range(count):
+    candidate = ipaddress.IPv4Network((base + (((first + offset) % count) << 8), 24))
+    if not any(candidate.overlaps(network) for network in occupied):
+        print(candidate)
+        break
+else:
+    sys.exit('No free transit subnet is available; resolve local route conflicts before installation.')
+PY
+}
+
 server_install() (
     set -Eeuo pipefail
     require_root
-    local endpoint='' port=51888 uplink='' subnet=10.203.240.0/24
+    local endpoint='' port=51888 uplink='' subnet=''
     while (($#)); do
         case $1 in
             --endpoint) (($# >= 2)) || die '--endpoint requires an IPv4 address'; endpoint=$2; shift 2 ;;
@@ -581,12 +690,13 @@ server_install() (
         esac
     done
     if [[ -z $endpoint ]]; then
-        [[ -t 0 ]] || die 'Specify --endpoint with the German VPS public IPv4 address.'
-        read -r -p 'German VPS public IPv4 address: ' endpoint
+        [[ -t 0 ]] || die 'Specify --endpoint with the exit VPS (Server 2) public IPv4 address.'
+        read -r -p 'Exit VPS (Server 2) public IPv4 address: ' endpoint
     fi
-    [[ ! -e "$STATE_DIR/client.conf" ]] || die 'This host is already configured as the Japan client.'
+    # A host may be both an entry client and an exit server. Their state,
+    # interfaces and firewall rules are independent; only transit routes overlap.
     [[ ! -e "$STATE_DIR/server.conf" && ! -e "$WG_CONF" ]] || die 'Exit server already installed, or az-relay.conf exists. Use status; existing keys are kept.'
-    [[ ! -e /root/antizapret-relay-client.json ]] || die '/root/antizapret-relay-client.json already exists; preserve or move it before installation.'
+    [[ ! -e "$SERVER_BUNDLE" ]] || die "$SERVER_BUNDLE already exists; preserve or move it before installation."
     [[ ! -e /etc/sysctl.d/98-antizapret-relay.conf ]] || die 'Relay sysctl file already exists.'
     [[ ! -e /etc/systemd/system/antizapret.service.d/90-antizapret-relay-server.conf ]] || die 'Relay systemd override already exists.'
     install_dependencies
@@ -609,13 +719,16 @@ server_install() (
     fi
     [[ $uplink =~ ^[a-zA-Z0-9_.:-]{1,15}$ && $uplink != lo && $uplink != "$WG_IF" && $uplink != warp-* ]] || die 'Could not select a physical Internet uplink; use --uplink.'
     ip link show dev "$uplink" >/dev/null 2>&1 || die "Uplink does not exist: $uplink"
+    local routes
+    routes=$(ip -j -4 route show table all)
+    if [[ -z $subnet ]]; then
+        subnet=$(server_choose_subnet "$endpoint" "$port" "$routes") || die 'Automatic transit subnet selection failed; no server configuration was changed.'
+    fi
     local subnet_values
     subnet_values=$(server_validate_subnet "$subnet") || die 'Invalid transit subnet.'
     local server_ip antizapret_ip vpn_ip
     { read -r _; read -r server_ip; read -r antizapret_ip; read -r vpn_ip; } <<<"$subnet_values"
     [[ $endpoint != "$server_ip" && $endpoint != "$antizapret_ip" && $endpoint != "$vpn_ip" ]] || die 'Endpoint must not be in the transit subnet.'
-    local routes
-    routes=$(ip -j -4 route show table all)
     python3 - "$subnet" "$routes" <<'PY' || die 'Transit subnet overlaps an existing route; choose another --subnet.'
 import ipaddress
 import json
@@ -628,6 +741,8 @@ for route in json.loads(sys.argv[2]):
     try:
         existing = ipaddress.ip_network(destination, strict=False)
     except ValueError:
+        continue
+    if existing.prefixlen == 0:
         continue
     if existing.overlaps(subnet):
         print('Conflicting route: ' + destination, file=sys.stderr)
@@ -643,7 +758,7 @@ PY
         if (( ! success && installed )); then
             systemctl disable --now "wg-quick@$WG_IF" >/dev/null 2>&1 || true
             server_firewall down >/dev/null 2>&1 || true
-            rm -f -- "$WG_CONF" "$STATE_DIR/server.conf" /root/antizapret-relay-client.json \
+            rm -f -- "$WG_CONF" "$STATE_DIR/server.conf" "$SERVER_BUNDLE" \
                 /etc/sysctl.d/98-antizapret-relay.conf \
                 /etc/systemd/system/antizapret.service.d/90-antizapret-relay-server.conf
             systemctl daemon-reload >/dev/null 2>&1 || true
@@ -667,16 +782,16 @@ PrivateKey = $server_private
 ListenPort = $port
 MTU = 1280
 Table = off
-PostUp = $APP firewall up
-PostDown = $APP firewall down
+PostUp = $APP firewall up server
+PostDown = $APP firewall down server
 
 [Peer]
-# Japan: AntiZapret clients
+# Entry VPS (Server 1): AntiZapret clients
 PublicKey = $antizapret_public
 AllowedIPs = $antizapret_ip/32
 
 [Peer]
-# Japan: full VPN clients (distinct key required)
+# Entry VPS (Server 1): full VPN clients (distinct key required)
 PublicKey = $vpn_public
 AllowedIPs = $vpn_ip/32
 EOF
@@ -700,18 +815,18 @@ EOF
     installed=1
     install -m 600 "$transaction/server.conf" "$STATE_DIR/server.conf"
     install -m 600 "$transaction/az-relay.conf" "$WG_CONF"
-    install -m 600 "$transaction/client.json" /root/antizapret-relay-client.json
+    install -m 600 "$transaction/client.json" "$SERVER_BUNDLE"
     printf 'net.ipv4.ip_forward=1\n' >/etc/sysctl.d/98-antizapret-relay.conf
     chmod 644 /etc/sysctl.d/98-antizapret-relay.conf
     # Do not make a firewall-repair failure take the existing VPN service offline.
-    printf '[Service]\nExecStartPost=-%s firewall up\n' "$APP" >/etc/systemd/system/antizapret.service.d/90-antizapret-relay-server.conf
+    printf '[Service]\nExecStartPost=-%s firewall up server\n' "$APP" >/etc/systemd/system/antizapret.service.d/90-antizapret-relay-server.conf
     chmod 644 /etc/systemd/system/antizapret.service.d/90-antizapret-relay-server.conf
     sysctl -q -w net.ipv4.ip_forward=1
     systemctl daemon-reload
     systemctl enable --now "wg-quick@$WG_IF"
     success=1
-    log "Exit server is ready at $endpoint:$port (UDP)."
-    log 'Copy /root/antizapret-relay-client.json securely to the Japan VPS; it contains private keys.'
+    log "Exit VPS (Server 2) is ready at $endpoint:$port (UDP)."
+    log "Copy $SERVER_BUNDLE securely to the entry VPS (Server 1); it contains private keys."
     log 'Allow this UDP port in the VPS provider firewall, if the provider uses one.'
 )
 
@@ -721,7 +836,7 @@ server_uninstall() {
     systemctl disable --now "wg-quick@$WG_IF"
     server_firewall down
     rm -f -- "$WG_CONF" /etc/sysctl.d/98-antizapret-relay.conf /etc/systemd/system/antizapret.service.d/90-antizapret-relay-server.conf
-    rm -f -- /root/antizapret-relay-client.json "$STATE_DIR/server.conf"
+    rm -f -- "$SERVER_BUNDLE" "$STATE_DIR/server.conf"
     systemctl daemon-reload
     log 'Exit server removed. Other VPN interfaces and firewall rules are kept.'
     log 'Runtime IPv4 forwarding is kept enabled because the existing AntiZapret may require it.'
@@ -767,16 +882,17 @@ client_install() {
             *) die "Unknown client option: $argument" ;;
         esac
     done
-    [[ -n $bundle && -f $bundle ]] || die 'Usage: client --bundle /root/antizapret-relay-client.json [--domain old.yummyani.me]'
+    [[ -n $bundle && -f $bundle ]] || die 'Usage: client --bundle /root/antizapret-relay-import.json [--domain old.yummyani.me]'
     install_dependencies
     client_compatibility
-    [[ ! -e $STATE_DIR/client.conf && ! -e $STATE_DIR/server.conf ]] || die 'Relay already installed. Use status or uninstall before reconfiguring.'
+    [[ ! -e $STATE_DIR/client.conf ]] || die 'Client role already installed. Use status or uninstall --role client before reconfiguring.'
     [[ ! -e $STATE_DIR/setup.before.json && ! -e $STATE_DIR/setup.snapshot && ! -e $STATE_DIR/client-values.json ]] || die 'Previous installation metadata exists. Preserve and resolve it before installing.'
     [[ ! -e $CLIENT_DOMAINS && ! -e $CLIENT_DROPIN ]] || die 'Reserved relay domain file or systemd drop-in already exists.'
     stage=$(mktemp -d)
     # Validate all imported data before touching the running installation.
     if ! config_tool validate-bundle "$bundle" > "$stage/validated"; then rm -rf -- "$stage"; return 1; fi
     ip -j -4 route show table all > "$stage/routes.json"
+    # A local donor may coexist, but its transit /24 must differ from this donor's.
     if ! config_tool check-routes "$bundle" "$stage/routes.json"; then rm -rf -- "$stage"; return 1; fi
     : > "$stage/domains"
     for domain in "${domains[@]}"; do
@@ -814,7 +930,7 @@ PY
     config_tool apply "$AZ_DIR/setup" "$STATE_DIR/setup.before.json" "$STATE_DIR/client-values.json"
     install -m 0600 "$stage/domains" "$CLIENT_DOMAINS"
     install -d -m 0755 "$(dirname "$CLIENT_DROPIN")"
-    printf '[Service]\nExecStartPost=%s firewall up\n' "$APP" > "$CLIENT_DROPIN"
+    printf '[Service]\nExecStartPost=%s firewall up client\n' "$APP" > "$CLIENT_DROPIN"
     chmod 0644 "$CLIENT_DROPIN"
     systemctl daemon-reload
     client_firewall up
@@ -885,12 +1001,17 @@ usage() {
     cat <<'HELP'
 AntiZapret Relay: use your own WireGuard VPS instead of Cloudflare WARP.
 
-Download install.sh to a file, then run as root:
-  bash install.sh server --endpoint GERMANY_PUBLIC_IPV4 [--port 51888] [--uplink eth0]
-  bash install.sh client --bundle /root/antizapret-relay-client.json --domain old.yummyani.me
+Client VPS (Server 1): users connect to its AntiZapret.
+Donor VPS (Server 2): selected domains use its public IP.
+One VPS can run BOTH roles. Tunnel subnets and keys are selected automatically.
+Download install.sh to both servers, then run as root:
+  # On Server 2:
+  bash install.sh server --endpoint SERVER2_PUBLIC_IPV4 [--port 51888] [--uplink eth0]
+  # On Server 1, after copying the bundle from Server 2:
+  bash install.sh client --bundle /root/antizapret-relay-import.json --domain old.yummyani.me
 
-Server creates /root/antizapret-relay-client.json (SECRET). Copy it privately to
-the Japan VPS using scp. Never upload this file or WireGuard keys to GitHub.
+Donor creates /root/antizapret-relay-donor.json (SECRET). Copy it privately to
+the client as /root/antizapret-relay-import.json. Never publish private keys.
 Client replaces WARP peers for both AntiZapret and full VPN custom-domain mode.
 Use --antizapret-only to leave the full VPN WARP peer unchanged. DNS WARP stays
 unchanged. Existing shared WARP include/exclude lists continue to apply.
@@ -901,25 +1022,69 @@ After installation:
   antizapret-relay domain list
   antizapret-relay status
   antizapret-relay uninstall
+  antizapret-relay uninstall --role client
+  antizapret-relay uninstall --role server
+  antizapret-relay uninstall --role all
+
+Upgrade an existing installation without restarting its tunnels:
+  bash install.sh upgrade
 HELP
 }
 
 relay_status() {
+    local found=n
     if [[ -f $STATE_DIR/server.conf ]]; then
-        log 'Role: server (exit VPS)'
+        found=y
+        log 'Role: DONOR (server): other VPS use this host as their exit.'
         systemctl --no-pager status wg-quick@az-relay.service || true
         wg show az-relay || true
-    elif [[ -f $STATE_DIR/client.conf ]]; then
-        log 'Role: client (AntiZapret entry VPS)'
+    fi
+    if [[ -f $STATE_DIR/client.conf ]]; then
+        found=y
+        log 'Role: CLIENT: selected domains from this AntiZapret use another donor.'
         systemctl --no-pager status antizapret.service || true
         wg show warp-antizapret || true
         wg show warp-vpn || true
         log 'Relay domain file (also see native WARP include/exclude lists):'
         config_tool domain-list "$CLIENT_DOMAINS"
         log 'Handshake age and RX bytes confirm connectivity; an interface alone does not.'
-    else
-        die 'Relay is not installed on this host.'
     fi
+    [[ $found == y ]] || die 'Relay is not installed on this host.'
+}
+
+firewall_command() {
+    local action=${1:-} role=${2:-all}
+    [[ $# -le 2 && ( $action == up || $action == down ) ]] || die 'Usage: firewall up|down [client|server|all]'
+    case "$role" in
+        server) server_firewall "$action" ;;
+        client) client_firewall "$action" ;;
+        all) server_firewall "$action"; client_firewall "$action" ;;
+        *) die 'Firewall role must be client, server or all.' ;;
+    esac
+}
+
+uninstall_command() {
+    local role=''
+    if (($#)); then
+        [[ $# -eq 2 && $1 == --role ]] || die 'Usage: uninstall [--role client|server|all]'
+        role=$2
+    elif [[ -f $STATE_DIR/client.conf && -f $STATE_DIR/server.conf ]]; then
+        die 'Both roles are installed. Choose uninstall --role client, --role server or --role all.'
+    elif [[ -f $STATE_DIR/client.conf ]]; then role=client
+    elif [[ -f $STATE_DIR/server.conf ]]; then role=server
+    else die 'Relay is not installed.'
+    fi
+    case "$role" in
+        client) [[ -f $STATE_DIR/client.conf ]] || die 'Client role is not installed.'; client_uninstall ;;
+        server) [[ -f $STATE_DIR/server.conf ]] || die 'Donor role is not installed.'; server_uninstall ;;
+        all)
+            [[ -f $STATE_DIR/client.conf || -f $STATE_DIR/server.conf ]] || die 'Relay is not installed.'
+            if [[ -f $STATE_DIR/client.conf ]]; then client_uninstall; fi
+            if [[ -f $STATE_DIR/server.conf ]]; then server_uninstall; fi
+            ;;
+        *) die 'Uninstall role must be client, server or all.' ;;
+    esac
+    log "Removed role: $role. The installer remains available."
 }
 
 relay_main() {
@@ -937,22 +1102,22 @@ relay_main() {
     case "$command_name" in
         server) server_install "$@" ;;
         client) client_install "$@" ;;
-        firewall)
-            [[ ${1:-} == up || ${1:-} == down ]] || die 'firewall up|down required'
-            server_firewall "$1"
-            client_firewall "$1"
-            ;;
+        firewall) firewall_command "$@" ;;
         domain) domain_command "$@" ;;
         status) relay_status ;;
-        uninstall)
-            if [[ -f $STATE_DIR/client.conf ]]; then client_uninstall
-            elif [[ -f $STATE_DIR/server.conf ]]; then server_uninstall
-            else die 'Relay is not installed.'; fi
-            log 'Relay removed. The installer remains available for a future installation.'
+        uninstall) uninstall_command "$@" ;;
+        upgrade)
+            [[ $# -eq 0 ]] || die 'Usage: upgrade'
+            [[ -f $STATE_DIR/client.conf || -f $STATE_DIR/server.conf ]] || die 'Install a role first.'
+            install_dependencies
+            install_self
+            log 'Installer and firewall hooks upgraded. Existing keys and tunnel addresses are kept.'
             ;;
         *) usage >&2; die "Unknown command: $command_name" ;;
     esac
 }
 
-SCRIPT_FILE=$(readlink -f "${BASH_SOURCE[0]}")
-relay_main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    SCRIPT_FILE=$(readlink -f "${BASH_SOURCE[0]}")
+    relay_main "$@"
+fi

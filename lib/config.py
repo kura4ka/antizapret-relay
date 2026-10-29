@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -178,16 +179,16 @@ def _read_lines(path):
     return text.splitlines(keepends=True)
 
 
-def atomic_write(path, content):
+def atomic_write(path, content, mode=0o600):
     path = Path(path)
     if path.is_symlink():
         raise ConfigError("Refusing to replace a symbolic link.")
     temporary = None
     try:
         descriptor, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            os.chmod(temporary, 0o600)
-            handle.write(content)
+        with os.fdopen(descriptor, "wb") as handle:
+            os.chmod(temporary, mode)
+            handle.write(content.encode("utf-8") if isinstance(content, str) else content)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -196,6 +197,63 @@ def atomic_write(path, content):
     finally:
         if temporary and os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _require_root_owned_regular(path):
+    try:
+        metadata = Path(path).lstat()
+    except OSError as exc:
+        raise ConfigError("Cannot inspect local role configuration.") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ConfigError("Refusing to migrate a symbolic link.")
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0:
+        raise ConfigError("Role configuration must be a root-owned regular file.")
+    return metadata
+
+
+def scope_hooks(state_dir, wg_conf, app, dropin_dir):
+    """Migrate only exact installer-owned legacy hooks, without restarting services."""
+    if not app.startswith("/") or any(character in app for character in ("\r", "\n", "\x00")):
+        raise ConfigError("Invalid installed application path.")
+    state_dir, dropin_dir = Path(state_dir), Path(dropin_dir)
+    candidates = []
+    if (state_dir / "server.conf").exists() or (state_dir / "server.conf").is_symlink():
+        _require_root_owned_regular(state_dir / "server.conf")
+        candidates.extend((
+            (Path(wg_conf), {
+                f"PostUp = {app} firewall up": f"PostUp = {app} firewall up server",
+                f"PostDown = {app} firewall down": f"PostDown = {app} firewall down server",
+            }),
+            (dropin_dir / "90-antizapret-relay-server.conf", {
+                f"ExecStartPost=-{app} firewall up": f"ExecStartPost=-{app} firewall up server",
+                f"ExecStartPost={app} firewall up": f"ExecStartPost={app} firewall up server",
+            }),
+        ))
+    if (state_dir / "client.conf").exists() or (state_dir / "client.conf").is_symlink():
+        _require_root_owned_regular(state_dir / "client.conf")
+        candidates.append((dropin_dir / "90-antizapret-relay-client.conf", {
+            f"ExecStartPost={app} firewall up": f"ExecStartPost={app} firewall up client",
+        }))
+    updates = []
+    for path, substitutions in candidates:
+        if not path.exists() and not path.is_symlink():
+            continue
+        metadata = _require_root_owned_regular(path)
+        try:
+            original = path.read_bytes()
+        except OSError as exc:
+            raise ConfigError("Cannot read local role configuration.") from exc
+        replacements = {old.encode("utf-8"): new.encode("utf-8") for old, new in substitutions.items()}
+        lines = []
+        for line in original.splitlines(keepends=True):
+            body = line.rstrip(b"\r\n")
+            lines.append(replacements.get(body, body) + line[len(body):])
+        migrated = b"".join(lines)
+        if migrated != original:
+            updates.append((path, migrated, stat.S_IMODE(metadata.st_mode)))
+    # Validate every target before the first write, especially symlink targets.
+    for path, content, mode in updates:
+        atomic_write(path, content, mode=mode)
 
 
 def _assignments(lines, names):
@@ -333,6 +391,8 @@ def main(argv):
             print("\n".join(validate_bundle(args[0])))
         elif operation == "check-routes" and len(args) == 2:
             check_routes(*args)
+        elif operation == "scope-hooks" and len(args) == 4:
+            scope_hooks(*args)
         elif operation == "normalize-domain" and len(args) == 1:
             print(normalize_domain(args[0]))
         elif operation == "apply" and len(args) == 3:

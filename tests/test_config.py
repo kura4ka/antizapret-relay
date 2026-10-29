@@ -2,11 +2,14 @@ import base64
 import importlib.util
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -264,6 +267,115 @@ class DomainListTests(TemporaryFiles):
         with self.assertRaises(config.ConfigError):
             config.domains("domain-add", path, "*.example.com")
         self.assertEqual(path.read_bytes(), before)
+
+
+class HookMigrationTests(TemporaryFiles):
+    def setUp(self):
+        super().setUp()
+        self.state = self.root / "state"
+        self.dropins = self.root / "dropins"
+        self.state.mkdir()
+        self.dropins.mkdir()
+        self.app = "/usr/local/sbin/antizapret-relay"
+        self.wg = self.root / "az-relay.conf"
+        self.server_dropin = self.dropins / "90-antizapret-relay-server.conf"
+        self.client_dropin = self.dropins / "90-antizapret-relay-client.conf"
+        self.server_state = self.state / "server.conf"
+        self.client_state = self.state / "client.conf"
+        self.server_state.write_bytes(b"RELAY_SUBNET=10.203.240.0/24\nSECRET=unchanged\n")
+        self.client_state.write_bytes(b"prefix=10\nonly=n\n")
+        self.wg_original = (
+            b"[Interface]\r\nPrivateKey = keep-this-exactly\r\n"
+            + f"PostUp = {self.app} firewall up\r\nPostDown = {self.app} firewall down\r\n".encode()
+            + f"# PostUp = {self.app} firewall up\r\n".encode()
+            + b"PostUp = /custom/firewall up\r\n[Peer]\r\nPublicKey = preserved-key"
+        )
+        self.wg.write_bytes(self.wg_original)
+        self.server_original = f"[Service]\nExecStartPost=-{self.app} firewall up\nEnvironment=KEEP=1\n".encode()
+        self.client_original = f"[Service]\nExecStartPost={self.app} firewall up\n# unchanged\n".encode()
+        self.server_dropin.write_bytes(self.server_original)
+        self.client_dropin.write_bytes(self.client_original)
+        os.chmod(self.wg, 0o600)
+        os.chmod(self.server_dropin, 0o644)
+        os.chmod(self.client_dropin, 0o640)
+
+    def migrate(self):
+        # Fixtures belong to the invoking user in rootless Unix CI. Keep all
+        # production path/type checks while substituting only fixture ownership.
+        if os.name != "nt" and os.geteuid() != 0:
+            original_check = config._require_root_owned_regular
+            def fixture_check(path):
+                metadata = Path(path).lstat()
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                    return original_check(path)
+                return metadata
+            with mock.patch.object(config, "_require_root_owned_regular", side_effect=fixture_check):
+                return config.scope_hooks(self.state, self.wg, self.app, self.dropins)
+        return config.scope_hooks(self.state, self.wg, self.app, self.dropins)
+
+    def test_exact_legacy_hooks_change_and_keys_and_metadata_remain_byte_identical(self):
+        states_before = [path.read_bytes() for path in (self.server_state, self.client_state)]
+        self.migrate()
+        expected_wg = self.wg_original.replace(
+            f"\r\nPostUp = {self.app} firewall up\r\n".encode(),
+            f"\r\nPostUp = {self.app} firewall up server\r\n".encode(),
+        ).replace(
+            f"\r\nPostDown = {self.app} firewall down\r\n".encode(),
+            f"\r\nPostDown = {self.app} firewall down server\r\n".encode(),
+        )
+        self.assertEqual(self.wg.read_bytes(), expected_wg)
+        self.assertEqual(self.server_dropin.read_bytes(), self.server_original.replace(b" firewall up\n", b" firewall up server\n"))
+        self.assertEqual(self.client_dropin.read_bytes(), self.client_original.replace(b" firewall up\n", b" firewall up client\n"))
+        self.assertEqual([path.read_bytes() for path in (self.server_state, self.client_state)], states_before)
+        with mock.patch.object(config, "atomic_write") as writer:
+            self.migrate()
+            writer.assert_not_called()
+
+    def test_server_hook_without_ignore_failure_prefix_is_scoped(self):
+        self.server_dropin.write_bytes(f"[Service]\nExecStartPost={self.app} firewall up\n".encode())
+        self.migrate()
+        self.assertEqual(self.server_dropin.read_bytes(), f"[Service]\nExecStartPost={self.app} firewall up server\n".encode())
+
+    def test_absent_role_state_leaves_that_roles_hooks_untouched(self):
+        self.server_state.unlink()
+        self.migrate()
+        self.assertEqual(self.wg.read_bytes(), self.wg_original)
+        self.assertEqual(self.server_dropin.read_bytes(), self.server_original)
+        self.assertIn(b" firewall up client\n", self.client_dropin.read_bytes())
+        self.client_state.unlink()
+        self.server_state.write_bytes(b"# donor present\n")
+        self.client_dropin.write_bytes(self.client_original)
+        self.migrate()
+        self.assertEqual(self.client_dropin.read_bytes(), self.client_original)
+        self.assertIn(b" firewall down server\r\n", self.wg.read_bytes())
+
+    def test_symbolic_link_target_is_rejected_before_any_other_file_is_changed(self):
+        target = self.root / "outside.conf"
+        target.write_bytes(self.client_original)
+        self.client_dropin.unlink()
+        try:
+            self.client_dropin.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("Creating symlinks is unavailable on this host")
+        with self.assertRaises(config.ConfigError):
+            self.migrate()
+        self.assertEqual(self.wg.read_bytes(), self.wg_original)
+        self.assertEqual(self.server_dropin.read_bytes(), self.server_original)
+        self.assertEqual(target.read_bytes(), self.client_original)
+
+    def test_untrusted_owners_and_link_metadata_are_rejected(self):
+        for mode, owner in ((stat.S_IFREG | 0o600, 1000), (stat.S_IFLNK | 0o777, 0), (stat.S_IFDIR | 0o700, 0)):
+            with self.subTest(mode=mode, owner=owner), mock.patch.object(
+                Path, "lstat", return_value=SimpleNamespace(st_mode=mode, st_uid=owner)
+            ), self.assertRaises(config.ConfigError):
+                config._require_root_owned_regular(self.wg)
+
+    @unittest.skipIf(os.name == "nt", "Windows does not expose Unix chmod semantics")
+    def test_migration_preserves_existing_file_permissions(self):
+        self.migrate()
+        self.assertEqual(self.wg.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.server_dropin.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(self.client_dropin.stat().st_mode & 0o777, 0o640)
 
 
 if __name__ == "__main__":

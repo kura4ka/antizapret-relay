@@ -1,4 +1,5 @@
-# German exit server. This file is concatenated into install.sh by build.py.
+# Exit VPS (Server 2). This file is concatenated into install.sh by build.py.
+SERVER_BUNDLE=/root/antizapret-relay-donor.json
 
 server_load_state() {
     [[ -f "$STATE_DIR/server.conf" && ! -L "$STATE_DIR/server.conf" ]] || die 'Exit server is not installed.'
@@ -131,10 +132,54 @@ print(subnet.network_address + 3)
 PY
 }
 
+server_choose_subnet() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import hashlib
+import ipaddress
+import json
+import sys
+
+try:
+    endpoint = ipaddress.IPv4Address(sys.argv[1])
+    port = int(sys.argv[2], 10)
+    if not endpoint.is_global or endpoint.is_multicast or not 1024 <= port <= 65535:
+        raise ValueError()
+    inventory = json.loads(sys.argv[3])
+    if not isinstance(inventory, list):
+        raise ValueError()
+    occupied = []
+    for route in inventory:
+        if not isinstance(route, dict):
+            raise ValueError()
+        destination = route.get('dst', 'default')
+        if destination == 'default':
+            continue
+        network = ipaddress.IPv4Network(destination, strict=False)
+        # A default route is the Internet uplink, not an occupied private range.
+        if network.prefixlen:
+            occupied.append(network)
+except (ValueError, TypeError):
+    sys.exit('Cannot choose a transit subnet from the local routing inventory.')
+
+pool = ipaddress.IPv4Network('10.64.0.0/10')
+count = 1 << (24 - pool.prefixlen)
+seed = hashlib.sha256((str(endpoint) + ':' + str(port)).encode('ascii')).digest()
+first = int.from_bytes(seed, 'big') % count
+base = int(pool.network_address)
+for offset in range(count):
+    candidate = ipaddress.IPv4Network((base + (((first + offset) % count) << 8), 24))
+    if not any(candidate.overlaps(network) for network in occupied):
+        print(candidate)
+        break
+else:
+    sys.exit('No free transit subnet is available; resolve local route conflicts before installation.')
+PY
+}
+
 server_install() (
     set -Eeuo pipefail
     require_root
-    local endpoint='' port=51888 uplink='' subnet=10.203.240.0/24
+    local endpoint='' port=51888 uplink='' subnet=''
     while (($#)); do
         case $1 in
             --endpoint) (($# >= 2)) || die '--endpoint requires an IPv4 address'; endpoint=$2; shift 2 ;;
@@ -145,12 +190,13 @@ server_install() (
         esac
     done
     if [[ -z $endpoint ]]; then
-        [[ -t 0 ]] || die 'Specify --endpoint with the German VPS public IPv4 address.'
-        read -r -p 'German VPS public IPv4 address: ' endpoint
+        [[ -t 0 ]] || die 'Specify --endpoint with the exit VPS (Server 2) public IPv4 address.'
+        read -r -p 'Exit VPS (Server 2) public IPv4 address: ' endpoint
     fi
-    [[ ! -e "$STATE_DIR/client.conf" ]] || die 'This host is already configured as the Japan client.'
+    # A host may be both an entry client and an exit server. Their state,
+    # interfaces and firewall rules are independent; only transit routes overlap.
     [[ ! -e "$STATE_DIR/server.conf" && ! -e "$WG_CONF" ]] || die 'Exit server already installed, or az-relay.conf exists. Use status; existing keys are kept.'
-    [[ ! -e /root/antizapret-relay-client.json ]] || die '/root/antizapret-relay-client.json already exists; preserve or move it before installation.'
+    [[ ! -e "$SERVER_BUNDLE" ]] || die "$SERVER_BUNDLE already exists; preserve or move it before installation."
     [[ ! -e /etc/sysctl.d/98-antizapret-relay.conf ]] || die 'Relay sysctl file already exists.'
     [[ ! -e /etc/systemd/system/antizapret.service.d/90-antizapret-relay-server.conf ]] || die 'Relay systemd override already exists.'
     install_dependencies
@@ -173,13 +219,16 @@ server_install() (
     fi
     [[ $uplink =~ ^[a-zA-Z0-9_.:-]{1,15}$ && $uplink != lo && $uplink != "$WG_IF" && $uplink != warp-* ]] || die 'Could not select a physical Internet uplink; use --uplink.'
     ip link show dev "$uplink" >/dev/null 2>&1 || die "Uplink does not exist: $uplink"
+    local routes
+    routes=$(ip -j -4 route show table all)
+    if [[ -z $subnet ]]; then
+        subnet=$(server_choose_subnet "$endpoint" "$port" "$routes") || die 'Automatic transit subnet selection failed; no server configuration was changed.'
+    fi
     local subnet_values
     subnet_values=$(server_validate_subnet "$subnet") || die 'Invalid transit subnet.'
     local server_ip antizapret_ip vpn_ip
     { read -r _; read -r server_ip; read -r antizapret_ip; read -r vpn_ip; } <<<"$subnet_values"
     [[ $endpoint != "$server_ip" && $endpoint != "$antizapret_ip" && $endpoint != "$vpn_ip" ]] || die 'Endpoint must not be in the transit subnet.'
-    local routes
-    routes=$(ip -j -4 route show table all)
     python3 - "$subnet" "$routes" <<'PY' || die 'Transit subnet overlaps an existing route; choose another --subnet.'
 import ipaddress
 import json
@@ -192,6 +241,8 @@ for route in json.loads(sys.argv[2]):
     try:
         existing = ipaddress.ip_network(destination, strict=False)
     except ValueError:
+        continue
+    if existing.prefixlen == 0:
         continue
     if existing.overlaps(subnet):
         print('Conflicting route: ' + destination, file=sys.stderr)
@@ -207,7 +258,7 @@ PY
         if (( ! success && installed )); then
             systemctl disable --now "wg-quick@$WG_IF" >/dev/null 2>&1 || true
             server_firewall down >/dev/null 2>&1 || true
-            rm -f -- "$WG_CONF" "$STATE_DIR/server.conf" /root/antizapret-relay-client.json \
+            rm -f -- "$WG_CONF" "$STATE_DIR/server.conf" "$SERVER_BUNDLE" \
                 /etc/sysctl.d/98-antizapret-relay.conf \
                 /etc/systemd/system/antizapret.service.d/90-antizapret-relay-server.conf
             systemctl daemon-reload >/dev/null 2>&1 || true
@@ -231,16 +282,16 @@ PrivateKey = $server_private
 ListenPort = $port
 MTU = 1280
 Table = off
-PostUp = $APP firewall up
-PostDown = $APP firewall down
+PostUp = $APP firewall up server
+PostDown = $APP firewall down server
 
 [Peer]
-# Japan: AntiZapret clients
+# Entry VPS (Server 1): AntiZapret clients
 PublicKey = $antizapret_public
 AllowedIPs = $antizapret_ip/32
 
 [Peer]
-# Japan: full VPN clients (distinct key required)
+# Entry VPS (Server 1): full VPN clients (distinct key required)
 PublicKey = $vpn_public
 AllowedIPs = $vpn_ip/32
 EOF
@@ -264,18 +315,18 @@ EOF
     installed=1
     install -m 600 "$transaction/server.conf" "$STATE_DIR/server.conf"
     install -m 600 "$transaction/az-relay.conf" "$WG_CONF"
-    install -m 600 "$transaction/client.json" /root/antizapret-relay-client.json
+    install -m 600 "$transaction/client.json" "$SERVER_BUNDLE"
     printf 'net.ipv4.ip_forward=1\n' >/etc/sysctl.d/98-antizapret-relay.conf
     chmod 644 /etc/sysctl.d/98-antizapret-relay.conf
     # Do not make a firewall-repair failure take the existing VPN service offline.
-    printf '[Service]\nExecStartPost=-%s firewall up\n' "$APP" >/etc/systemd/system/antizapret.service.d/90-antizapret-relay-server.conf
+    printf '[Service]\nExecStartPost=-%s firewall up server\n' "$APP" >/etc/systemd/system/antizapret.service.d/90-antizapret-relay-server.conf
     chmod 644 /etc/systemd/system/antizapret.service.d/90-antizapret-relay-server.conf
     sysctl -q -w net.ipv4.ip_forward=1
     systemctl daemon-reload
     systemctl enable --now "wg-quick@$WG_IF"
     success=1
-    log "Exit server is ready at $endpoint:$port (UDP)."
-    log 'Copy /root/antizapret-relay-client.json securely to the Japan VPS; it contains private keys.'
+    log "Exit VPS (Server 2) is ready at $endpoint:$port (UDP)."
+    log "Copy $SERVER_BUNDLE securely to the entry VPS (Server 1); it contains private keys."
     log 'Allow this UDP port in the VPS provider firewall, if the provider uses one.'
 )
 
@@ -285,7 +336,7 @@ server_uninstall() {
     systemctl disable --now "wg-quick@$WG_IF"
     server_firewall down
     rm -f -- "$WG_CONF" /etc/sysctl.d/98-antizapret-relay.conf /etc/systemd/system/antizapret.service.d/90-antizapret-relay-server.conf
-    rm -f -- /root/antizapret-relay-client.json "$STATE_DIR/server.conf"
+    rm -f -- "$SERVER_BUNDLE" "$STATE_DIR/server.conf"
     systemctl daemon-reload
     log 'Exit server removed. Other VPN interfaces and firewall rules are kept.'
     log 'Runtime IPv4 forwarding is kept enabled because the existing AntiZapret may require it.'

@@ -2,7 +2,7 @@
 # This file is compiled into install.sh by tools/build.py.
 set -Eeuo pipefail
 umask 077
-VERSION=0.1.0
+VERSION=0.2.0
 STATE_DIR=/etc/antizapret-relay
 APP=/usr/local/sbin/antizapret-relay
 WG_IF=az-relay
@@ -56,6 +56,10 @@ install_self() {
         install -m 0755 "$SCRIPT_FILE" "$APP"
     fi
     install -d -m 0700 "$STATE_DIR"
+    # Older installations called firewall for both roles from each hook. Scope
+    # those hooks before a second role is added, without restarting tunnels.
+    config_tool scope-hooks "$STATE_DIR" "$WG_CONF" "$APP" /etc/systemd/system/antizapret.service.d
+    systemctl daemon-reload
 }
 ipt_add() {
     local table=$1 chain=$2; shift 2

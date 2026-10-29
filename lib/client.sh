@@ -38,16 +38,17 @@ client_install() {
             *) die "Unknown client option: $argument" ;;
         esac
     done
-    [[ -n $bundle && -f $bundle ]] || die 'Usage: client --bundle /root/antizapret-relay-client.json [--domain old.yummyani.me]'
+    [[ -n $bundle && -f $bundle ]] || die 'Usage: client --bundle /root/antizapret-relay-import.json [--domain old.yummyani.me]'
     install_dependencies
     client_compatibility
-    [[ ! -e $STATE_DIR/client.conf && ! -e $STATE_DIR/server.conf ]] || die 'Relay already installed. Use status or uninstall before reconfiguring.'
+    [[ ! -e $STATE_DIR/client.conf ]] || die 'Client role already installed. Use status or uninstall --role client before reconfiguring.'
     [[ ! -e $STATE_DIR/setup.before.json && ! -e $STATE_DIR/setup.snapshot && ! -e $STATE_DIR/client-values.json ]] || die 'Previous installation metadata exists. Preserve and resolve it before installing.'
     [[ ! -e $CLIENT_DOMAINS && ! -e $CLIENT_DROPIN ]] || die 'Reserved relay domain file or systemd drop-in already exists.'
     stage=$(mktemp -d)
     # Validate all imported data before touching the running installation.
     if ! config_tool validate-bundle "$bundle" > "$stage/validated"; then rm -rf -- "$stage"; return 1; fi
     ip -j -4 route show table all > "$stage/routes.json"
+    # A local donor may coexist, but its transit /24 must differ from this donor's.
     if ! config_tool check-routes "$bundle" "$stage/routes.json"; then rm -rf -- "$stage"; return 1; fi
     : > "$stage/domains"
     for domain in "${domains[@]}"; do
@@ -85,7 +86,7 @@ PY
     config_tool apply "$AZ_DIR/setup" "$STATE_DIR/setup.before.json" "$STATE_DIR/client-values.json"
     install -m 0600 "$stage/domains" "$CLIENT_DOMAINS"
     install -d -m 0755 "$(dirname "$CLIENT_DROPIN")"
-    printf '[Service]\nExecStartPost=%s firewall up\n' "$APP" > "$CLIENT_DROPIN"
+    printf '[Service]\nExecStartPost=%s firewall up client\n' "$APP" > "$CLIENT_DROPIN"
     chmod 0644 "$CLIENT_DROPIN"
     systemctl daemon-reload
     client_firewall up
