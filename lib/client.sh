@@ -38,7 +38,7 @@ client_install() {
             *) die "Unknown client option: $argument" ;;
         esac
     done
-    [[ -n $bundle && -f $bundle ]] || die 'Usage: client --bundle /root/antizapret-relay-import.json [--domain old.yummyani.me]'
+    [[ -n $bundle && -f $bundle ]] || die 'Usage: client --bundle /root/antizapret-relay-import.json [--domain example.com]'
     install_dependencies
     client_compatibility
     [[ ! -e $STATE_DIR/client.conf ]] || die 'Client role already installed. Use status or uninstall --role client before reconfiguring.'
@@ -96,7 +96,7 @@ PY
     rm -rf -- "$stage"
     log 'Installed. Native WARP domain lists now use your exit VPS.'
     log 'Run: antizapret-relay status'
-    log 'For a site: antizapret-relay domain add old.yummyani.me'
+    log 'For a site: antizapret-relay domain add example.com'
     log 'Delete the imported client JSON from the source and destination after you have backed it up securely.'
 }
 

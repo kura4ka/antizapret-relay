@@ -9,7 +9,7 @@ Download install.sh to both servers, then run as root:
   # On Server 2:
   bash install.sh server --endpoint SERVER2_PUBLIC_IPV4 [--port 51888] [--uplink eth0]
   # On Server 1, after copying the bundle from Server 2:
-  bash install.sh client --bundle /root/antizapret-relay-import.json --domain old.yummyani.me
+  bash install.sh client --bundle /root/antizapret-relay-import.json --domain example.com
 
 Donor creates /root/antizapret-relay-donor.json (SECRET). Copy it privately to
 the client as /root/antizapret-relay-import.json. Never publish private keys.
@@ -18,8 +18,8 @@ Use --antizapret-only to leave the full VPN WARP peer unchanged. DNS WARP stays
 unchanged. Existing shared WARP include/exclude lists continue to apply.
 
 After installation:
-  antizapret-relay domain add old.yummyani.me
-  antizapret-relay domain remove old.yummyani.me
+  antizapret-relay domain add example.com
+  antizapret-relay domain remove example.com
   antizapret-relay domain list
   antizapret-relay status
   antizapret-relay uninstall
