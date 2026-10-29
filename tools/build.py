@@ -12,7 +12,7 @@ def build():
         + (ROOT / 'lib/config.py').read_text(encoding='utf-8').rstrip()
         + "\nAZ_RELAY_CONFIG_PY\n}\n",
     ]
-    for name in ('server.sh', 'client.sh', 'main.sh'):
+    for name in ('server.sh', 'client.sh', 'wizard.sh', 'main.sh'):
         sections.append((ROOT / 'lib' / name).read_text(encoding='utf-8').rstrip())
     result = '\n\n'.join(sections) + '\n'
     (ROOT / 'install.sh').write_text(result, encoding='utf-8', newline='\n')

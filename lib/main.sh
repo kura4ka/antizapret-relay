@@ -5,6 +5,11 @@ AntiZapret Relay: use your own WireGuard VPS instead of Cloudflare WARP.
 Client VPS (Server 1): users connect to its AntiZapret.
 Donor VPS (Server 2): selected domains use its public IP.
 One VPS can run BOTH roles. Tunnel subnets and keys are selected automatically.
+Easy setup (run in an interactive SSH terminal):
+  bash install.sh
+Choose 1) Client, 2) Server / donor, or 3) Both, then follow the IP prompts.
+Client fetches donor keys over SSH as root; existing imported bundles also work.
+
 Download install.sh to both servers, then run as root:
   # On Server 2:
   bash install.sh server --endpoint SERVER2_PUBLIC_IPV4 [--port 51888] [--uplink eth0]
@@ -99,7 +104,7 @@ uninstall_command() {
 }
 
 relay_main() {
-    local command_name=${1:-help}
+    local command_name=${1:-install}
     shift || true
     case "$command_name" in
         help|-h|--help) usage; return ;;
@@ -111,6 +116,7 @@ relay_main() {
     # Firewall is also called synchronously by systemd while install holds fd 9.
     if [[ $command_name != firewall ]]; then flock -n 9 || die 'Another relay operation is running.'; fi
     case "$command_name" in
+        install) [[ $# -eq 0 ]] || die 'Usage: bash install.sh [install]'; interactive_install ;;
         server) server_install "$@" ;;
         client) client_install "$@" ;;
         firewall) firewall_command "$@" ;;
