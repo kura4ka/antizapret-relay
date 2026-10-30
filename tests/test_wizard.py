@@ -34,9 +34,11 @@ def donor_bundle():
 
 HARNESS = r'''
 source "$COMMON_SOURCE"
+source "$PRESETS_SOURCE"
 source "$WIZARD_SOURCE"
 STATE_DIR=$TEST_STATE
 AZ_DIR=$TEST_AZ
+CLIENT_INCLUDES=$TEST_INCLUDES
 SERVER_BUNDLE=$TEST_SERVER_BUNDLE
 WIZARD_IMPORT=$TEST_IMPORT
 require_root() { :; }
@@ -55,8 +57,10 @@ client_install() {
     [[ $1 == --bundle && -f $2 ]] || die 'Missing donor connection file'
     config_tool validate-bundle "$2" > /dev/null || return 1
     printf 'CLIENT\n' >> "$TEST_EVENTS"
+    if [[ ${3:-} == --gemini ]]; then printf 'GEMINI\n' >> "$TEST_EVENTS"; fi
     printf '# installed client\n' > "$STATE_DIR/client.conf"
 }
+gemini_enable() { printf 'GEMINI\n' >> "$TEST_EVENTS"; }
 scp() {
     local destination
     printf 'SCP %s\n' "$*" >> "$TEST_EVENTS"
@@ -104,11 +108,13 @@ class WizardTests(unittest.TestCase):
             env = {
                 **os.environ,
                 'COMMON_SOURCE': (ROOT / 'lib/common.sh').as_posix(),
+                'PRESETS_SOURCE': (ROOT / 'lib/presets.sh').as_posix(),
                 'WIZARD_SOURCE': (ROOT / 'lib/wizard.sh').as_posix(),
                 'CONFIG_SOURCE': (ROOT / 'lib/config.py').as_posix(),
                 'PYTHON_EXE': Path(sys.executable).as_posix(),
                 'TEST_STATE': state.as_posix(),
                 'TEST_AZ': antizapret.as_posix(),
+                'TEST_INCLUDES': include.as_posix(),
                 'TEST_SERVER_BUNDLE': (sandbox / 'export.json').as_posix(),
                 'TEST_IMPORT': imported_file.as_posix(),
                 'TEST_REMOTE_BUNDLE': remote_bundle.as_posix(),
@@ -182,13 +188,51 @@ class WizardTests(unittest.TestCase):
         self.assertEqual(result.state, {'client.conf': '# original client\n'})
 
     def test_existing_import_uses_validated_file_without_ssh(self):
-        result = self.run_wizard('wizard_client n', imported=True)
+        result = self.run_wizard('wizard_client n', replies='\n', imported=True)
         self.assert_success(result)
         self.assertEqual(result.events, ['CLIENT'])
         self.assertEqual(set(result.state), {'client.conf'})
 
+    def test_gemini_opt_in_adds_client_flag_and_accepts_case_insensitive_yes(self):
+        for reply in ('y\n', 'YES\n'):
+            with self.subTest(reply=reply):
+                result = self.run_wizard('wizard_client n', replies=reply, imported=True)
+                self.assert_success(result)
+                self.assertEqual(result.events, ['CLIENT', 'GEMINI'])
+
+    def test_gemini_opt_out_does_not_add_the_preset(self):
+        for reply in ('\n', 'n\n', 'NO\n'):
+            with self.subTest(reply=reply):
+                result = self.run_wizard('wizard_client n', replies=reply, imported=True)
+                self.assert_success(result)
+                self.assertEqual(result.events, ['CLIENT'])
+
+    def test_gemini_invalid_response_reprompts_before_installation(self):
+        result = self.run_wizard('wizard_client n', replies='maybe\nyes\n', imported=True)
+        self.assert_success(result)
+        self.assertIn('Enter y or n.', result.process.stdout)
+        self.assertEqual(result.events, ['CLIENT', 'GEMINI'])
+
+    def test_gemini_eof_does_not_start_client_installation(self):
+        result = self.run_wizard('wizard_client n', imported=True)
+        self.assertNotEqual(result.process.returncode, 0)
+        self.assertEqual(result.events, [])
+        self.assertEqual(result.state, {})
+
+    def test_existing_client_enables_gemini_without_reinstalling_either_role(self):
+        result = self.run_wizard('wizard_client n', replies='yes\n', roles=('client', 'server'))
+        self.assert_success(result)
+        self.assertEqual(result.events, ['GEMINI'])
+        self.assertEqual(result.state, {'client.conf': '# original client\n', 'server.conf': '# original server\n'})
+
+    def test_existing_client_gemini_eof_keeps_original_roles(self):
+        result = self.run_wizard('wizard_client n', roles=('client', 'server'))
+        self.assertNotEqual(result.process.returncode, 0)
+        self.assertEqual(result.events, [])
+        self.assertEqual(result.state, {'client.conf': '# original client\n', 'server.conf': '# original server\n'})
+
     def test_client_retrieves_bundle_with_normal_ssh_host_verification(self):
-        result = self.run_wizard('wizard_client n', replies='8.8.8.8\n\n')
+        result = self.run_wizard('wizard_client n', replies='8.8.8.8\n\n\n')
         self.assert_success(result)
         self.assertEqual(len(result.events), 2)
         self.assertTrue(result.events[0].startswith('SCP '))
@@ -240,16 +284,17 @@ class WizardTests(unittest.TestCase):
         self.assert_success(result)
         self.assertEqual(result.events, [])
         self.assertEqual(result.state, {'server.conf': '# original server\n'})
+        self.assertNotIn('Route Gemini', result.process.stderr)
 
     def test_existing_roles_are_skipped_by_setup_helpers(self):
-        result = self.run_wizard('wizard_server; wizard_client n', roles=('client', 'server'))
+        result = self.run_wizard('wizard_server; wizard_client n', replies='\n', roles=('client', 'server'))
         self.assert_success(result)
         self.assertEqual(result.events, [])
         self.assertEqual(result.state, {'client.conf': '# original client\n', 'server.conf': '# original server\n'})
 
     @unittest.skipIf(os.name == 'nt', 'Full TTY interaction requires a POSIX pseudo-terminal')
     def test_menu_client_uses_existing_import_and_shows_native_domain_instructions(self):
-        result = self.run_wizard('interactive_install', replies='1\n', imported=True, terminal=True)
+        result = self.run_wizard('interactive_install', replies='1\n\n', imported=True, terminal=True)
         self.assert_success(result)
         self.assertEqual(result.events, ['CLIENT'])
         output = result.process.stdout + result.process.stderr
@@ -263,10 +308,11 @@ class WizardTests(unittest.TestCase):
         self.assert_success(result)
         self.assertEqual(result.events, ['SERVER --endpoint 1.1.1.1 --port 51888'])
         self.assertEqual(set(result.state), {'server.conf'})
+        self.assertNotIn('Route Gemini', result.process.stderr)
 
     @unittest.skipIf(os.name == 'nt', 'Full TTY interaction requires a POSIX pseudo-terminal')
     def test_menu_both_installs_donor_first_and_then_remote_client(self):
-        result = self.run_wizard('interactive_install', replies='3\n1.1.1.1\n\n8.8.8.8\n\n', terminal=True)
+        result = self.run_wizard('interactive_install', replies='3\n1.1.1.1\n\n8.8.8.8\n\n\n', terminal=True)
         self.assert_success(result)
         self.assertTrue(result.events[0].startswith('SERVER '))
         self.assertTrue(result.events[1].startswith('SCP '))
@@ -275,7 +321,7 @@ class WizardTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == 'nt', 'Full TTY interaction requires a POSIX pseudo-terminal')
     def test_menu_both_preserves_existing_roles_without_reinstalling(self):
-        result = self.run_wizard('interactive_install', replies='3\n', roles=('client', 'server'), terminal=True)
+        result = self.run_wizard('interactive_install', replies='3\n\n', roles=('client', 'server'), terminal=True)
         self.assert_success(result)
         self.assertEqual(result.events, [])
         self.assertEqual(result.state, {'client.conf': '# original client\n', 'server.conf': '# original server\n'})

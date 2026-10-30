@@ -2,7 +2,7 @@
 # This file is compiled into install.sh by tools/build.py.
 set -Eeuo pipefail
 umask 077
-VERSION=0.3.1
+VERSION=0.3.2
 STATE_DIR=/etc/antizapret-relay
 APP=/usr/local/sbin/antizapret-relay
 WG_IF=az-relay

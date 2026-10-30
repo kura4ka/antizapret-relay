@@ -28,7 +28,7 @@ client_compatibility() {
 }
 
 client_install() {
-    local bundle='' only=n argument domain stage prefix
+    local bundle='' only=n gemini=n argument domain stage prefix
     local -a domains=()
     while (($#)); do
         argument=$1; shift
@@ -36,14 +36,15 @@ client_install() {
             --bundle) (($#)) || die '--bundle needs a path'; bundle=$1; shift ;;
             --domain) (($#)) || die '--domain needs a domain'; domains+=("$1"); shift ;;
             --antizapret-only) only=y ;;
+            --gemini) gemini=y ;;
             *) die "Unknown client option: $argument" ;;
         esac
     done
-    [[ -n $bundle && -f $bundle ]] || die 'Usage: client --bundle /root/antizapret-relay-import.json [--domain example.com]'
+    [[ -n $bundle && -f $bundle ]] || die 'Usage: client --bundle /root/antizapret-relay-import.json [--domain example.com] [--gemini]'
     install_dependencies
     client_compatibility
     [[ ! -e $STATE_DIR/client.conf ]] || die 'Client role already installed. Use status or uninstall --role client before reconfiguring.'
-    [[ ! -e $STATE_DIR/setup.before.json && ! -e $STATE_DIR/setup.snapshot && ! -e $STATE_DIR/client-values.json && ! -e $STATE_DIR/default-exclusions.json && ! -L $STATE_DIR/default-exclusions.json ]] || die 'Previous installation metadata exists. Preserve and resolve it before installing.'
+    [[ ! -e $STATE_DIR/setup.before.json && ! -e $STATE_DIR/setup.snapshot && ! -e $STATE_DIR/client-values.json && ! -e $STATE_DIR/default-exclusions.json && ! -L $STATE_DIR/default-exclusions.json && ! -e $STATE_DIR/gemini.before.json && ! -L $STATE_DIR/gemini.before.json ]] || die 'Previous installation metadata exists. Preserve and resolve it before installing.'
     [[ ! -e $CLIENT_DOMAINS && ! -e $CLIENT_DROPIN ]] || die 'Reserved relay domain file or systemd drop-in already exists.'
     stage=$(mktemp -d)
     # Validate all imported data before touching the running installation.
@@ -60,6 +61,12 @@ client_install() {
     if ! config_tool prepare-default-exclusions "$AZ_DIR/download" "$CLIENT_EXCLUDES" "$stage/exclusions" "$stage/default-exclusions.json"; then
         rm -rf -- "$stage"
         return 1
+    fi
+    if [[ $gemini == y ]]; then
+        if ! config_tool prepare-gemini "$CLIENT_INCLUDES" "$stage/gemini.before.json" >/dev/null; then
+            rm -rf -- "$stage"
+            return 1
+        fi
     fi
     python3 - "$bundle" "$stage/changes.json" "$only" <<'PY'
 import json, sys
@@ -88,11 +95,17 @@ PY
     printf 'prefix=%q\nonly=%q\n' "$prefix" "$only" > "$STATE_DIR/client.conf"
     install -m 0600 "$AZ_DIR/setup" "$STATE_DIR/setup.snapshot"
     install -m 0600 "$stage/default-exclusions.json" "$STATE_DIR/default-exclusions.json"
+    if [[ $gemini == y ]]; then
+        install -m 0600 "$stage/gemini.before.json" "$STATE_DIR/gemini.before.json"
+    fi
     log 'Stopping AntiZapret briefly to remove the old WireGuard routes cleanly.'
     systemctl stop antizapret.service
     # Any failure after this point restores the previous managed settings.
     config_tool apply "$AZ_DIR/setup" "$STATE_DIR/setup.before.json" "$STATE_DIR/client-values.json"
     config_tool apply-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"
+    if [[ $gemini == y ]]; then
+        config_tool apply-gemini "$CLIENT_INCLUDES" "$STATE_DIR/gemini.before.json"
+    fi
     install -m 0600 "$stage/domains" "$CLIENT_DOMAINS"
     install -d -m 0755 "$(dirname "$CLIENT_DROPIN")"
     printf '[Service]\nExecStartPost=%s firewall up client\n' "$APP" > "$CLIENT_DROPIN"
@@ -100,8 +113,9 @@ PY
     systemctl daemon-reload
     client_firewall up
     systemctl start antizapret.service
-    (cd "$AZ_DIR" && ./parse.sh)
+    (trap - ERR; cd "$AZ_DIR" && ./parse.sh)
     trap - ERR
+    rm -f -- "$STATE_DIR/gemini.before.json"
     rm -rf -- "$stage"
     log 'Installed. Native WARP domain lists now use your exit VPS.'
     log 'Bundled WARP defaults were added to the marked block in /root/antizapret/config/exclude-warp-hosts.txt.'
@@ -110,6 +124,9 @@ PY
     log 'Exclude domains from the donor: /root/antizapret/config/exclude-warp-hosts.txt'
     log 'To choose a bundled domain later, remove its matching exclusions before applying the lists.'
     log 'After editing the native lists, run: /root/antizapret/parse.sh'
+    if [[ $gemini == y ]]; then
+        log 'Gemini website and API domains were added to the native include list. Existing exclusions still apply.'
+    fi
     log 'Keep donor exports private. A manually copied import file may be deleted after a secure backup.'
 }
 
@@ -123,6 +140,13 @@ client_install_rollback() {
         config_tool restore "$AZ_DIR/setup" "$STATE_DIR/setup.before.json" || true
     elif [[ -f $STATE_DIR/setup.snapshot ]]; then
         install -m 0600 "$STATE_DIR/setup.snapshot" "$AZ_DIR/setup"
+    fi
+    if [[ -f $STATE_DIR/gemini.before.json ]]; then
+        if config_tool rollback-gemini "$CLIENT_INCLUDES" "$STATE_DIR/gemini.before.json"; then
+            rm -f -- "$STATE_DIR/gemini.before.json"
+        else
+            log 'Could not restore Gemini includes; recovery metadata is kept in /etc/antizapret-relay/gemini.before.json.'
+        fi
     fi
     if [[ -f $STATE_DIR/default-exclusions.json ]]; then
         if config_tool rollback-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"; then

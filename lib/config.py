@@ -550,6 +550,91 @@ def restore_default_exclusions(target_path, metadata_path, rollback=False, check
         atomic_write(target_path, updated, mode=mode)
 
 
+GEMINI_DOMAINS = ('gemini.google.com', 'generativelanguage.googleapis.com')
+
+
+def _render_gemini(original, added):
+    if not added:
+        return original
+    newline = '\r\n' if '\r\n' in original and '\n' not in original.replace('\r\n', '') else '\n'
+    separator = '' if not original or original.endswith('\n') else newline
+    return original + separator + ''.join(domain + newline for domain in added)
+
+
+def prepare_gemini(target_path, metadata_path):
+    """Stage an optional Gemini append without changing the native include list."""
+    target, backup = Path(target_path), Path(metadata_path)
+    if target.resolve() == backup.resolve():
+        raise ConfigError('Gemini include target and transaction backup must be distinct files.')
+    if target.is_symlink() or backup.is_symlink():
+        raise ConfigError('Refusing a symbolic-link Gemini include target or backup.')
+    if backup.exists():
+        raise ConfigError('Gemini transaction backup already exists; preserve it before retrying.')
+    existed, original, mode = _exclusion_file(target)
+    if mode > 0o777:
+        raise ConfigError('Native include lists with special permission bits require manual review.')
+    known = _native_warp_entries(original, strict=False)
+    added = [domain for domain in GEMINI_DOMAINS if domain not in known]
+    metadata = {'version': 1, 'target': str(target.resolve()), 'existed': existed,
+                'original': original, 'mode': mode, 'added': added}
+    serialized = json.dumps(metadata, ensure_ascii=True, indent=2) + '\n'
+    if len(serialized.encode('utf-8')) > 1024 * 1024:
+        raise ConfigError('Gemini transaction backup is too large.')
+    atomic_write(backup, serialized)
+    return len(added)
+
+
+def _gemini_metadata(target_path, metadata_path):
+    target, backup = Path(target_path), Path(metadata_path)
+    if target.resolve() == backup.resolve() or backup.is_symlink():
+        raise ConfigError('Invalid Gemini transaction backup path.')
+    metadata = read_json(backup)
+    fields = {'version', 'target', 'existed', 'original', 'mode', 'added'}
+    if not isinstance(metadata, dict) or set(metadata) != fields or type(metadata['version']) is not int or metadata['version'] != 1:
+        raise ConfigError('Invalid Gemini transaction backup.')
+    if metadata['target'] != str(target.resolve()) or type(metadata['existed']) is not bool:
+        raise ConfigError('Gemini transaction backup belongs to another target.')
+    original, mode, added = metadata['original'], metadata['mode'], metadata['added']
+    if not isinstance(original, str) or '\x00' in original:
+        raise ConfigError('Invalid original native include list in Gemini backup.')
+    if type(mode) is not int or not 0 <= mode <= 0o777:
+        raise ConfigError('Invalid original native include-list mode.')
+    if not metadata['existed'] and (original or mode != 0o600):
+        raise ConfigError('Invalid snapshot of a missing native include list.')
+    expected = [domain for domain in GEMINI_DOMAINS if domain not in _native_warp_entries(original, strict=False)]
+    if added != expected:
+        raise ConfigError('Gemini transaction backup contains unexpected domain changes.')
+    return metadata
+
+
+def apply_gemini(target_path, metadata_path):
+    metadata = _gemini_metadata(target_path, metadata_path)
+    existed, current, mode = _exclusion_file(target_path)
+    proposed = _render_gemini(metadata['original'], metadata['added'])
+    expected_exists = metadata['existed'] or bool(metadata['added'])
+    mode_matches = os.name == 'nt' or mode == metadata['mode']
+    if existed == expected_exists and current == proposed and (not existed or mode_matches):
+        return
+    if existed != metadata['existed'] or current != metadata['original'] or existed and not mode_matches:
+        raise ConfigError('Native include list changed after staging Gemini; preserve those changes and retry.')
+    if metadata['added']:
+        atomic_write(target_path, proposed, mode=metadata['mode'])
+
+
+def rollback_gemini(target_path, metadata_path):
+    metadata = _gemini_metadata(target_path, metadata_path)
+    existed, current, mode = _exclusion_file(target_path)
+    original = metadata['original']
+    proposed = _render_gemini(original, metadata['added'])
+    if current not in (original, proposed) or existed and os.name != 'nt' and mode != metadata['mode']:
+        raise ConfigError('Native include list changed during Gemini setup; retain the transaction backup for recovery.')
+    if not metadata['existed']:
+        if existed:
+            Path(target_path).unlink()
+    elif not existed or current != original:
+        atomic_write(target_path, original, mode=metadata['mode'])
+
+
 def main(argv):
     try:
         if not argv:
@@ -571,6 +656,14 @@ def main(argv):
             restore_default_exclusions(*args, rollback=True)
         elif operation == 'check-default-exclusions' and len(args) == 2:
             restore_default_exclusions(*args, check_only=True)
+        elif operation == 'prepare-gemini' and len(args) == 2:
+            print(prepare_gemini(*args))
+        elif operation == 'gemini-domains' and not args:
+            print('\n'.join(GEMINI_DOMAINS))
+        elif operation == 'apply-gemini' and len(args) == 2:
+            apply_gemini(*args)
+        elif operation == 'rollback-gemini' and len(args) == 2:
+            rollback_gemini(*args)
         elif operation == "normalize-domain" and len(args) == 1:
             print(normalize_domain(args[0]))
         elif operation == "apply" and len(args) == 3:

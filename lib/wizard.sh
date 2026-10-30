@@ -33,9 +33,24 @@ wizard_server() {
     server_install --endpoint "$endpoint" --port "$port"
 }
 
+gemini_install_prompt() {
+    local target=$1 answer
+    while true; do
+        wizard_read answer 'Route Gemini through the donor? [y/N]: ' n
+        case "${answer,,}" in
+            y|yes) printf -v "$target" '%s' y; return ;;
+            n|no) printf -v "$target" '%s' n; return ;;
+        esac
+        log 'Enter y or n.'
+    done
+}
+
 wizard_client() (
+    local gemini=n
     if [[ -f $STATE_DIR/client.conf ]]; then
         log 'Client role is already installed; keeping its donor and settings.'
+        gemini_install_prompt gemini
+        if [[ $gemini == y ]]; then gemini_enable; fi
         return 0
     fi
     local allow_defer=${1:-n} bundle='' donor_ip='' ssh_port='' wizard_stage='' own_bundle=''
@@ -99,8 +114,11 @@ if sys.argv[3]:
     if own.get('server_public_key') == bundle['server_public_key']:
         sys.exit('This is the local donor bundle. Enter the IP or import the keys of ANOTHER donor VPS.')
 PY
+    gemini_install_prompt gemini
+    local -a client_options=(--bundle "$bundle")
+    if [[ $gemini == y ]]; then client_options+=(--gemini); fi
     log 'Connecting the client to the donor. AntiZapret will restart briefly.'
-    client_install --bundle "$bundle"
+    client_install "${client_options[@]}"
 )
 
 wizard_done() {

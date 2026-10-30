@@ -9,12 +9,14 @@ Easy setup (run in an interactive SSH terminal):
   bash install.sh
 Choose 1) Client, 2) Server / donor, or 3) Both, then follow the IP prompts.
 Client fetches donor keys over SSH as root; existing imported bundles also work.
+Client setup also asks whether to add the Gemini website and API domains.
 
 Download install.sh to both servers, then run as root:
   # On Server 2:
   bash install.sh server --endpoint SERVER2_PUBLIC_IPV4 [--port 51888] [--uplink eth0]
   # On Server 1, after copying the bundle from Server 2:
   bash install.sh client --bundle /root/antizapret-relay-import.json
+  # Add --gemini to include Gemini website and API domains during client setup.
 
 Donor creates /root/antizapret-relay-donor.json (SECRET). Copy it privately to
 the client as /root/antizapret-relay-import.json. Never publish private keys.
@@ -33,6 +35,7 @@ After editing either file, apply changes on the client:
   /root/antizapret/parse.sh
 
 After installation:
+  antizapret-relay preset gemini
   antizapret-relay status
   antizapret-relay uninstall
   antizapret-relay uninstall --role client
@@ -125,6 +128,7 @@ relay_main() {
         client) client_install "$@" ;;
         firewall) firewall_command "$@" ;;
         domain) domain_command "$@" ;;
+        preset) preset_command "$@" ;;
         status) relay_status ;;
         uninstall) uninstall_command "$@" ;;
         upgrade)

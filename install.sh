@@ -2,7 +2,7 @@
 # This file is compiled into install.sh by tools/build.py.
 set -Eeuo pipefail
 umask 077
-VERSION=0.3.1
+VERSION=0.3.2
 STATE_DIR=/etc/antizapret-relay
 APP=/usr/local/sbin/antizapret-relay
 WG_IF=az-relay
@@ -628,6 +628,91 @@ def restore_default_exclusions(target_path, metadata_path, rollback=False, check
         atomic_write(target_path, updated, mode=mode)
 
 
+GEMINI_DOMAINS = ('gemini.google.com', 'generativelanguage.googleapis.com')
+
+
+def _render_gemini(original, added):
+    if not added:
+        return original
+    newline = '\r\n' if '\r\n' in original and '\n' not in original.replace('\r\n', '') else '\n'
+    separator = '' if not original or original.endswith('\n') else newline
+    return original + separator + ''.join(domain + newline for domain in added)
+
+
+def prepare_gemini(target_path, metadata_path):
+    """Stage an optional Gemini append without changing the native include list."""
+    target, backup = Path(target_path), Path(metadata_path)
+    if target.resolve() == backup.resolve():
+        raise ConfigError('Gemini include target and transaction backup must be distinct files.')
+    if target.is_symlink() or backup.is_symlink():
+        raise ConfigError('Refusing a symbolic-link Gemini include target or backup.')
+    if backup.exists():
+        raise ConfigError('Gemini transaction backup already exists; preserve it before retrying.')
+    existed, original, mode = _exclusion_file(target)
+    if mode > 0o777:
+        raise ConfigError('Native include lists with special permission bits require manual review.')
+    known = _native_warp_entries(original, strict=False)
+    added = [domain for domain in GEMINI_DOMAINS if domain not in known]
+    metadata = {'version': 1, 'target': str(target.resolve()), 'existed': existed,
+                'original': original, 'mode': mode, 'added': added}
+    serialized = json.dumps(metadata, ensure_ascii=True, indent=2) + '\n'
+    if len(serialized.encode('utf-8')) > 1024 * 1024:
+        raise ConfigError('Gemini transaction backup is too large.')
+    atomic_write(backup, serialized)
+    return len(added)
+
+
+def _gemini_metadata(target_path, metadata_path):
+    target, backup = Path(target_path), Path(metadata_path)
+    if target.resolve() == backup.resolve() or backup.is_symlink():
+        raise ConfigError('Invalid Gemini transaction backup path.')
+    metadata = read_json(backup)
+    fields = {'version', 'target', 'existed', 'original', 'mode', 'added'}
+    if not isinstance(metadata, dict) or set(metadata) != fields or type(metadata['version']) is not int or metadata['version'] != 1:
+        raise ConfigError('Invalid Gemini transaction backup.')
+    if metadata['target'] != str(target.resolve()) or type(metadata['existed']) is not bool:
+        raise ConfigError('Gemini transaction backup belongs to another target.')
+    original, mode, added = metadata['original'], metadata['mode'], metadata['added']
+    if not isinstance(original, str) or '\x00' in original:
+        raise ConfigError('Invalid original native include list in Gemini backup.')
+    if type(mode) is not int or not 0 <= mode <= 0o777:
+        raise ConfigError('Invalid original native include-list mode.')
+    if not metadata['existed'] and (original or mode != 0o600):
+        raise ConfigError('Invalid snapshot of a missing native include list.')
+    expected = [domain for domain in GEMINI_DOMAINS if domain not in _native_warp_entries(original, strict=False)]
+    if added != expected:
+        raise ConfigError('Gemini transaction backup contains unexpected domain changes.')
+    return metadata
+
+
+def apply_gemini(target_path, metadata_path):
+    metadata = _gemini_metadata(target_path, metadata_path)
+    existed, current, mode = _exclusion_file(target_path)
+    proposed = _render_gemini(metadata['original'], metadata['added'])
+    expected_exists = metadata['existed'] or bool(metadata['added'])
+    mode_matches = os.name == 'nt' or mode == metadata['mode']
+    if existed == expected_exists and current == proposed and (not existed or mode_matches):
+        return
+    if existed != metadata['existed'] or current != metadata['original'] or existed and not mode_matches:
+        raise ConfigError('Native include list changed after staging Gemini; preserve those changes and retry.')
+    if metadata['added']:
+        atomic_write(target_path, proposed, mode=metadata['mode'])
+
+
+def rollback_gemini(target_path, metadata_path):
+    metadata = _gemini_metadata(target_path, metadata_path)
+    existed, current, mode = _exclusion_file(target_path)
+    original = metadata['original']
+    proposed = _render_gemini(original, metadata['added'])
+    if current not in (original, proposed) or existed and os.name != 'nt' and mode != metadata['mode']:
+        raise ConfigError('Native include list changed during Gemini setup; retain the transaction backup for recovery.')
+    if not metadata['existed']:
+        if existed:
+            Path(target_path).unlink()
+    elif not existed or current != original:
+        atomic_write(target_path, original, mode=metadata['mode'])
+
+
 def main(argv):
     try:
         if not argv:
@@ -649,6 +734,14 @@ def main(argv):
             restore_default_exclusions(*args, rollback=True)
         elif operation == 'check-default-exclusions' and len(args) == 2:
             restore_default_exclusions(*args, check_only=True)
+        elif operation == 'prepare-gemini' and len(args) == 2:
+            print(prepare_gemini(*args))
+        elif operation == 'gemini-domains' and not args:
+            print('\n'.join(GEMINI_DOMAINS))
+        elif operation == 'apply-gemini' and len(args) == 2:
+            apply_gemini(*args)
+        elif operation == 'rollback-gemini' and len(args) == 2:
+            rollback_gemini(*args)
         elif operation == "normalize-domain" and len(args) == 1:
             print(normalize_domain(args[0]))
         elif operation == "apply" and len(args) == 3:
@@ -675,6 +768,51 @@ if __name__ == "__main__":
 AZ_RELAY_CONFIG_PY
 }
 
+
+# Optional domain presets use the normal user-owned AntiZapret include list.
+CLIENT_INCLUDES=/root/antizapret/config/include-warp-hosts.txt
+
+gemini_domains() {
+    config_tool gemini-domains
+}
+
+gemini_enable() (
+    [[ -f $STATE_DIR/client.conf ]] || die 'Install the client role before enabling a domain preset.'
+    client_compatibility
+    local preset_stage added
+    preset_stage=$(mktemp -d)
+    trap 'rm -rf -- "$preset_stage"' EXIT
+    added=$(config_tool prepare-gemini "$CLIENT_INCLUDES" "$preset_stage/gemini.before.json")
+    [[ $added =~ ^[0-9]+$ ]] || die 'Could not prepare the Gemini domain list.'
+    if [[ $added == 0 ]]; then
+        log 'Gemini website and API domains are already in the native include list. Existing exclusions still apply.'
+        return 0
+    fi
+    trap 'gemini_enable_rollback "$preset_stage"' ERR
+    config_tool apply-gemini "$CLIENT_INCLUDES" "$preset_stage/gemini.before.json"
+    (trap - ERR; cd "$AZ_DIR" && ./parse.sh)
+    trap - ERR
+    log 'Added Gemini website and API domains to /root/antizapret/config/include-warp-hosts.txt and applied the lists.'
+    log 'Existing exclusions are kept. Remove any matching Gemini exclusions if you want these domains to use the donor.'
+)
+
+gemini_enable_rollback() {
+    local preset_stage=$1
+    trap - ERR
+    if config_tool rollback-gemini "$CLIENT_INCLUDES" "$preset_stage/gemini.before.json"; then
+        (cd "$AZ_DIR" && ./parse.sh) || log 'Could not reload the restored list; rerun /root/antizapret/parse.sh after resolving the error.'
+    else
+        # Do not discard the only recovery snapshot when the user edited the list.
+        trap - EXIT
+        log "Gemini recovery snapshot is kept at $preset_stage/gemini.before.json."
+    fi
+    die 'Could not apply the Gemini preset. Existing donor settings and keys are kept.'
+}
+
+preset_command() {
+    [[ $# -eq 1 && $1 == gemini ]] || die 'Usage: antizapret-relay preset gemini'
+    gemini_enable
+}
 
 # Exit VPS (Server 2). This file is concatenated into install.sh by build.py.
 SERVER_BUNDLE=/root/antizapret-relay-donor.json
@@ -1050,7 +1188,7 @@ client_compatibility() {
 }
 
 client_install() {
-    local bundle='' only=n argument domain stage prefix
+    local bundle='' only=n gemini=n argument domain stage prefix
     local -a domains=()
     while (($#)); do
         argument=$1; shift
@@ -1058,14 +1196,15 @@ client_install() {
             --bundle) (($#)) || die '--bundle needs a path'; bundle=$1; shift ;;
             --domain) (($#)) || die '--domain needs a domain'; domains+=("$1"); shift ;;
             --antizapret-only) only=y ;;
+            --gemini) gemini=y ;;
             *) die "Unknown client option: $argument" ;;
         esac
     done
-    [[ -n $bundle && -f $bundle ]] || die 'Usage: client --bundle /root/antizapret-relay-import.json [--domain example.com]'
+    [[ -n $bundle && -f $bundle ]] || die 'Usage: client --bundle /root/antizapret-relay-import.json [--domain example.com] [--gemini]'
     install_dependencies
     client_compatibility
     [[ ! -e $STATE_DIR/client.conf ]] || die 'Client role already installed. Use status or uninstall --role client before reconfiguring.'
-    [[ ! -e $STATE_DIR/setup.before.json && ! -e $STATE_DIR/setup.snapshot && ! -e $STATE_DIR/client-values.json && ! -e $STATE_DIR/default-exclusions.json && ! -L $STATE_DIR/default-exclusions.json ]] || die 'Previous installation metadata exists. Preserve and resolve it before installing.'
+    [[ ! -e $STATE_DIR/setup.before.json && ! -e $STATE_DIR/setup.snapshot && ! -e $STATE_DIR/client-values.json && ! -e $STATE_DIR/default-exclusions.json && ! -L $STATE_DIR/default-exclusions.json && ! -e $STATE_DIR/gemini.before.json && ! -L $STATE_DIR/gemini.before.json ]] || die 'Previous installation metadata exists. Preserve and resolve it before installing.'
     [[ ! -e $CLIENT_DOMAINS && ! -e $CLIENT_DROPIN ]] || die 'Reserved relay domain file or systemd drop-in already exists.'
     stage=$(mktemp -d)
     # Validate all imported data before touching the running installation.
@@ -1082,6 +1221,12 @@ client_install() {
     if ! config_tool prepare-default-exclusions "$AZ_DIR/download" "$CLIENT_EXCLUDES" "$stage/exclusions" "$stage/default-exclusions.json"; then
         rm -rf -- "$stage"
         return 1
+    fi
+    if [[ $gemini == y ]]; then
+        if ! config_tool prepare-gemini "$CLIENT_INCLUDES" "$stage/gemini.before.json" >/dev/null; then
+            rm -rf -- "$stage"
+            return 1
+        fi
     fi
     python3 - "$bundle" "$stage/changes.json" "$only" <<'PY'
 import json, sys
@@ -1110,11 +1255,17 @@ PY
     printf 'prefix=%q\nonly=%q\n' "$prefix" "$only" > "$STATE_DIR/client.conf"
     install -m 0600 "$AZ_DIR/setup" "$STATE_DIR/setup.snapshot"
     install -m 0600 "$stage/default-exclusions.json" "$STATE_DIR/default-exclusions.json"
+    if [[ $gemini == y ]]; then
+        install -m 0600 "$stage/gemini.before.json" "$STATE_DIR/gemini.before.json"
+    fi
     log 'Stopping AntiZapret briefly to remove the old WireGuard routes cleanly.'
     systemctl stop antizapret.service
     # Any failure after this point restores the previous managed settings.
     config_tool apply "$AZ_DIR/setup" "$STATE_DIR/setup.before.json" "$STATE_DIR/client-values.json"
     config_tool apply-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"
+    if [[ $gemini == y ]]; then
+        config_tool apply-gemini "$CLIENT_INCLUDES" "$STATE_DIR/gemini.before.json"
+    fi
     install -m 0600 "$stage/domains" "$CLIENT_DOMAINS"
     install -d -m 0755 "$(dirname "$CLIENT_DROPIN")"
     printf '[Service]\nExecStartPost=%s firewall up client\n' "$APP" > "$CLIENT_DROPIN"
@@ -1122,8 +1273,9 @@ PY
     systemctl daemon-reload
     client_firewall up
     systemctl start antizapret.service
-    (cd "$AZ_DIR" && ./parse.sh)
+    (trap - ERR; cd "$AZ_DIR" && ./parse.sh)
     trap - ERR
+    rm -f -- "$STATE_DIR/gemini.before.json"
     rm -rf -- "$stage"
     log 'Installed. Native WARP domain lists now use your exit VPS.'
     log 'Bundled WARP defaults were added to the marked block in /root/antizapret/config/exclude-warp-hosts.txt.'
@@ -1132,6 +1284,9 @@ PY
     log 'Exclude domains from the donor: /root/antizapret/config/exclude-warp-hosts.txt'
     log 'To choose a bundled domain later, remove its matching exclusions before applying the lists.'
     log 'After editing the native lists, run: /root/antizapret/parse.sh'
+    if [[ $gemini == y ]]; then
+        log 'Gemini website and API domains were added to the native include list. Existing exclusions still apply.'
+    fi
     log 'Keep donor exports private. A manually copied import file may be deleted after a secure backup.'
 }
 
@@ -1145,6 +1300,13 @@ client_install_rollback() {
         config_tool restore "$AZ_DIR/setup" "$STATE_DIR/setup.before.json" || true
     elif [[ -f $STATE_DIR/setup.snapshot ]]; then
         install -m 0600 "$STATE_DIR/setup.snapshot" "$AZ_DIR/setup"
+    fi
+    if [[ -f $STATE_DIR/gemini.before.json ]]; then
+        if config_tool rollback-gemini "$CLIENT_INCLUDES" "$STATE_DIR/gemini.before.json"; then
+            rm -f -- "$STATE_DIR/gemini.before.json"
+        else
+            log 'Could not restore Gemini includes; recovery metadata is kept in /etc/antizapret-relay/gemini.before.json.'
+        fi
     fi
     if [[ -f $STATE_DIR/default-exclusions.json ]]; then
         if config_tool rollback-default-exclusions "$CLIENT_EXCLUDES" "$STATE_DIR/default-exclusions.json"; then
@@ -1270,9 +1432,24 @@ wizard_server() {
     server_install --endpoint "$endpoint" --port "$port"
 }
 
+gemini_install_prompt() {
+    local target=$1 answer
+    while true; do
+        wizard_read answer 'Route Gemini through the donor? [y/N]: ' n
+        case "${answer,,}" in
+            y|yes) printf -v "$target" '%s' y; return ;;
+            n|no) printf -v "$target" '%s' n; return ;;
+        esac
+        log 'Enter y or n.'
+    done
+}
+
 wizard_client() (
+    local gemini=n
     if [[ -f $STATE_DIR/client.conf ]]; then
         log 'Client role is already installed; keeping its donor and settings.'
+        gemini_install_prompt gemini
+        if [[ $gemini == y ]]; then gemini_enable; fi
         return 0
     fi
     local allow_defer=${1:-n} bundle='' donor_ip='' ssh_port='' wizard_stage='' own_bundle=''
@@ -1336,8 +1513,11 @@ if sys.argv[3]:
     if own.get('server_public_key') == bundle['server_public_key']:
         sys.exit('This is the local donor bundle. Enter the IP or import the keys of ANOTHER donor VPS.')
 PY
+    gemini_install_prompt gemini
+    local -a client_options=(--bundle "$bundle")
+    if [[ $gemini == y ]]; then client_options+=(--gemini); fi
     log 'Connecting the client to the donor. AntiZapret will restart briefly.'
-    client_install --bundle "$bundle"
+    client_install "${client_options[@]}"
 )
 
 wizard_done() {
@@ -1397,12 +1577,14 @@ Easy setup (run in an interactive SSH terminal):
   bash install.sh
 Choose 1) Client, 2) Server / donor, or 3) Both, then follow the IP prompts.
 Client fetches donor keys over SSH as root; existing imported bundles also work.
+Client setup also asks whether to add the Gemini website and API domains.
 
 Download install.sh to both servers, then run as root:
   # On Server 2:
   bash install.sh server --endpoint SERVER2_PUBLIC_IPV4 [--port 51888] [--uplink eth0]
   # On Server 1, after copying the bundle from Server 2:
   bash install.sh client --bundle /root/antizapret-relay-import.json
+  # Add --gemini to include Gemini website and API domains during client setup.
 
 Donor creates /root/antizapret-relay-donor.json (SECRET). Copy it privately to
 the client as /root/antizapret-relay-import.json. Never publish private keys.
@@ -1421,6 +1603,7 @@ After editing either file, apply changes on the client:
   /root/antizapret/parse.sh
 
 After installation:
+  antizapret-relay preset gemini
   antizapret-relay status
   antizapret-relay uninstall
   antizapret-relay uninstall --role client
@@ -1513,6 +1696,7 @@ relay_main() {
         client) client_install "$@" ;;
         firewall) firewall_command "$@" ;;
         domain) domain_command "$@" ;;
+        preset) preset_command "$@" ;;
         status) relay_status ;;
         uninstall) uninstall_command "$@" ;;
         upgrade)
