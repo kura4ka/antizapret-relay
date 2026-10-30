@@ -1,10 +1,8 @@
 # AntiZapret Relay
 
-Модуль для [AntiZapret-VPN](https://github.com/GubernievS/AntiZapret-VPN): выбранные сайты открываются через другой ваш VPS вместо Cloudflare WARP.
+Модуль для [AntiZapret-VPN](https://github.com/GubernievS/AntiZapret-VPN): Ваш VPS вместо Cloudflare WARP.
 
 Используется штатная маршрутизация AntiZapret в режиме **Custom**: домены задаются в `config/include-warp-hosts.txt`, исключения — в `config/exclude-warp-hosts.txt`. Модуль подключает ваш донорский VPS вместо Cloudflare; списки обрабатывает сам AntiZapret. Названия WARP в его настройках сохраняются.
-
-**Донор** — VPS, через IP которого должны открываться сайты. **Клиент** — VPS с установленным AntiZapret, к которому подключаются ваши пользователи. Здесь клиентом называется сервер, а не телефон или компьютер.
 
 Оба VPS могут находиться где угодно. Подсети, туннельные адреса и ключи создаются автоматически. На доноре AntiZapret необязателен; на клиенте он должен быть установлен и работать. Поддерживаются Debian/Ubuntu с systemd и WireGuard; целевые версии — Debian 13 и Ubuntu 24.04.
 
@@ -222,4 +220,4 @@ antizapret-relay domain remove example.org
 
 </details>
 
-Подробности работы, ограничения и проверенный upstream-коммит — в [описании архитектуры](docs/architecture.md). Автоматические проверки проходят в [GitHub Actions](https://github.com/kura4ka/antizapret-relay/actions); испытание на реальной паре VPS ещё требуется.
+Подробности работы, ограничения и проверенный upstream-коммит — в [описании архитектуры](docs/architecture.md). Автоматические проверки проходят в [GitHub Actions](https://github.com/kura4ka/antizapret-relay/actions)
