@@ -14,14 +14,14 @@ gemini_enable() (
     added=$(config_tool prepare-gemini "$CLIENT_INCLUDES" "$preset_stage/gemini.before.json")
     [[ $added =~ ^[0-9]+$ ]] || die 'Could not prepare the Gemini domain list.'
     if [[ $added == 0 ]]; then
-        log 'Gemini website and API domains are already in the native include list. Existing exclusions still apply.'
+        log 'All Gemini preset domains are already in the native include list. Existing exclusions still apply.'
         return 0
     fi
     trap 'gemini_enable_rollback "$preset_stage"' ERR
     config_tool apply-gemini "$CLIENT_INCLUDES" "$preset_stage/gemini.before.json"
     (trap - ERR; cd "$AZ_DIR" && ./parse.sh)
     trap - ERR
-    log 'Added Gemini website and API domains to /root/antizapret/config/include-warp-hosts.txt and applied the lists.'
+    log 'Added missing Gemini preset domains to /root/antizapret/config/include-warp-hosts.txt and applied the lists.'
     log 'Existing exclusions are kept. Remove any matching Gemini exclusions if you want these domains to use the donor.'
 )
 

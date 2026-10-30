@@ -2,7 +2,7 @@
 # This file is compiled into install.sh by tools/build.py.
 set -Eeuo pipefail
 umask 077
-VERSION=0.3.2
+VERSION=0.3.3
 STATE_DIR=/etc/antizapret-relay
 APP=/usr/local/sbin/antizapret-relay
 WG_IF=az-relay
@@ -628,7 +628,55 @@ def restore_default_exclusions(target_path, metadata_path, rollback=False, check
         atomic_write(target_path, updated, mode=mode)
 
 
-GEMINI_DOMAINS = ('gemini.google.com', 'generativelanguage.googleapis.com')
+GEMINI_DOMAINS = (
+    'gemini.google.com',
+    'generativelanguage.googleapis.com',
+    'lh5.googleusercontent.com',
+    'googleapis.com',
+    'ssl.gstatic.com',
+    'fonts.googleapis.com',
+    'play.google.com',
+    'ogs.google.com',
+    'apis.google.com',
+    'jnn-pa.googleapis.com',
+    'waa-pa.clients6.google.com',
+    'i.ytimg.com',
+    'yt3.ggpht.com',
+    'googleusercontent.com',
+    'maps.gstatic.com',
+    'lh3.google.com',
+    'ogads-pa.clients6.google.com',
+    'csp.withgoogle.com',
+    'googletagmanager.com',
+    'maps.googleapis.com',
+    'static.doubleclick.net',
+    'gstatic.com',
+    'td.doubleclick.net',
+    'googleads.g.doubleclick.net',
+    'google-analytics.com',
+    'optimizationguide-pa.googleapis.com',
+    'encrypted-tbn0.gstatic.com',
+    'encrypted-tbn1.gstatic.com',
+    'encrypted-tbn2.gstatic.com',
+    'encrypted-tbn3.gstatic.com',
+    'streetviewpixels-pa.googleapis.com',
+    'content-autofill.googleapis.com',
+    'accounts.google.com',
+    'gemini.gstatic.com',
+    'geminiweb-pa.clients6.google.com',
+    'signaler-pa.clients6.google.com',
+    'robinfrontend-pa.googleapis.com',
+    'notifications-pa.googleapis.com',
+    'oauth2.googleapis.com',
+    'oauthaccountmanager.googleapis.com',
+    'signaler-pa.googleapis.com',
+    'accountcapabilities-pa.googleapis.com',
+    'fonts.gstatic.com',
+    'inappcheck.itunes.apple.com',
+    'mzstorekit.itunes.apple.com',
+    'subscriptionsfirstparty-pa.googleapis.com',
+    'firebaseinstallations.googleapis.com',
+)
 
 
 def _render_gemini(original, added):
@@ -785,14 +833,14 @@ gemini_enable() (
     added=$(config_tool prepare-gemini "$CLIENT_INCLUDES" "$preset_stage/gemini.before.json")
     [[ $added =~ ^[0-9]+$ ]] || die 'Could not prepare the Gemini domain list.'
     if [[ $added == 0 ]]; then
-        log 'Gemini website and API domains are already in the native include list. Existing exclusions still apply.'
+        log 'All Gemini preset domains are already in the native include list. Existing exclusions still apply.'
         return 0
     fi
     trap 'gemini_enable_rollback "$preset_stage"' ERR
     config_tool apply-gemini "$CLIENT_INCLUDES" "$preset_stage/gemini.before.json"
     (trap - ERR; cd "$AZ_DIR" && ./parse.sh)
     trap - ERR
-    log 'Added Gemini website and API domains to /root/antizapret/config/include-warp-hosts.txt and applied the lists.'
+    log 'Added missing Gemini preset domains to /root/antizapret/config/include-warp-hosts.txt and applied the lists.'
     log 'Existing exclusions are kept. Remove any matching Gemini exclusions if you want these domains to use the donor.'
 )
 
@@ -1285,7 +1333,7 @@ PY
     log 'To choose a bundled domain later, remove its matching exclusions before applying the lists.'
     log 'After editing the native lists, run: /root/antizapret/parse.sh'
     if [[ $gemini == y ]]; then
-        log 'Gemini website and API domains were added to the native include list. Existing exclusions still apply.'
+        log 'Gemini preset domains were added to the native include list. Existing exclusions still apply.'
     fi
     log 'Keep donor exports private. A manually copied import file may be deleted after a secure backup.'
 }
@@ -1577,14 +1625,14 @@ Easy setup (run in an interactive SSH terminal):
   bash install.sh
 Choose 1) Client, 2) Server / donor, or 3) Both, then follow the IP prompts.
 Client fetches donor keys over SSH as root; existing imported bundles also work.
-Client setup also asks whether to add the Gemini website and API domains.
+Client setup also asks whether to add the Gemini domain preset.
 
 Download install.sh to both servers, then run as root:
   # On Server 2:
   bash install.sh server --endpoint SERVER2_PUBLIC_IPV4 [--port 51888] [--uplink eth0]
   # On Server 1, after copying the bundle from Server 2:
   bash install.sh client --bundle /root/antizapret-relay-import.json
-  # Add --gemini to include Gemini website and API domains during client setup.
+  # Add --gemini to include the full Gemini domain preset during client setup.
 
 Donor creates /root/antizapret-relay-donor.json (SECRET). Copy it privately to
 the client as /root/antizapret-relay-import.json. Never publish private keys.

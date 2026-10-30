@@ -125,7 +125,7 @@ PY
     log 'To choose a bundled domain later, remove its matching exclusions before applying the lists.'
     log 'After editing the native lists, run: /root/antizapret/parse.sh'
     if [[ $gemini == y ]]; then
-        log 'Gemini website and API domains were added to the native include list. Existing exclusions still apply.'
+        log 'Gemini preset domains were added to the native include list. Existing exclusions still apply.'
     fi
     log 'Keep donor exports private. A manually copied import file may be deleted after a secure backup.'
 }

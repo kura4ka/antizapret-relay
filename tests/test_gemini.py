@@ -19,7 +19,53 @@ BASH = shutil.which('bash') or r'C:\Program Files\Git\bin\bash.exe'
 SPEC = importlib.util.spec_from_file_location('gemini_config', ROOT / 'lib/config.py')
 config = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(config)
-DOMAINS = ('gemini.google.com', 'generativelanguage.googleapis.com')
+DOMAINS = tuple('''gemini.google.com
+generativelanguage.googleapis.com
+lh5.googleusercontent.com
+googleapis.com
+ssl.gstatic.com
+fonts.googleapis.com
+play.google.com
+ogs.google.com
+apis.google.com
+jnn-pa.googleapis.com
+waa-pa.clients6.google.com
+i.ytimg.com
+yt3.ggpht.com
+googleusercontent.com
+maps.gstatic.com
+lh3.google.com
+ogads-pa.clients6.google.com
+csp.withgoogle.com
+googletagmanager.com
+maps.googleapis.com
+static.doubleclick.net
+gstatic.com
+td.doubleclick.net
+googleads.g.doubleclick.net
+google-analytics.com
+optimizationguide-pa.googleapis.com
+encrypted-tbn0.gstatic.com
+encrypted-tbn1.gstatic.com
+encrypted-tbn2.gstatic.com
+encrypted-tbn3.gstatic.com
+streetviewpixels-pa.googleapis.com
+content-autofill.googleapis.com
+accounts.google.com
+gemini.gstatic.com
+geminiweb-pa.clients6.google.com
+signaler-pa.clients6.google.com
+robinfrontend-pa.googleapis.com
+notifications-pa.googleapis.com
+oauth2.googleapis.com
+oauthaccountmanager.googleapis.com
+signaler-pa.googleapis.com
+accountcapabilities-pa.googleapis.com
+fonts.gstatic.com
+inappcheck.itunes.apple.com
+mzstorekit.itunes.apple.com
+subscriptionsfirstparty-pa.googleapis.com
+firebaseinstallations.googleapis.com'''.splitlines())
 
 
 class GeminiConfigTests(unittest.TestCase):
@@ -30,10 +76,17 @@ class GeminiConfigTests(unittest.TestCase):
         self.target = self.root / 'include-warp-hosts.txt'
         self.metadata = self.root / 'before.json'
 
-    def test_staging_is_read_only_and_appends_only_the_two_core_domains(self):
+    def test_preset_matches_all_requested_domains_and_documented_list(self):
+        self.assertEqual(len(DOMAINS), 47)
+        self.assertEqual(len(set(DOMAINS)), 47)
+        self.assertEqual(tuple(config.GEMINI_DOMAINS), DOMAINS)
+        documented = (ROOT / 'docs/gemini-domains.txt').read_text(encoding='utf-8').splitlines()
+        self.assertEqual(documented, list(DOMAINS))
+
+    def test_staging_is_read_only_and_appends_the_full_requested_preset(self):
         original = b'# My routing\ncustom.example\n'
         self.target.write_bytes(original)
-        self.assertEqual(config.prepare_gemini(self.target, self.metadata), 2)
+        self.assertEqual(config.prepare_gemini(self.target, self.metadata), len(DOMAINS))
         self.assertEqual(self.target.read_bytes(), original)
         config.apply_gemini(self.target, self.metadata)
         self.assertEqual(self.target.read_bytes(), original + ('\n'.join(DOMAINS) + '\n').encode())
@@ -41,11 +94,24 @@ class GeminiConfigTests(unittest.TestCase):
     def test_case_comments_and_duplicate_entries_are_preserved_without_duplication(self):
         original = b'# Gemini\n GEMINI.GOOGLE.COM # chosen\ngemini.google.com\n'
         self.target.write_bytes(original)
-        self.assertEqual(config.prepare_gemini(self.target, self.metadata), 1)
+        self.assertEqual(config.prepare_gemini(self.target, self.metadata), len(DOMAINS) - 1)
         config.apply_gemini(self.target, self.metadata)
-        self.assertEqual(self.target.read_bytes(), original + b'generativelanguage.googleapis.com\n')
+        expected = original + ('\n'.join(DOMAINS[1:]) + '\n').encode()
+        self.assertEqual(self.target.read_bytes(), expected)
         config.apply_gemini(self.target, self.metadata)
-        self.assertEqual(self.target.read_bytes(), original + b'generativelanguage.googleapis.com\n')
+        self.assertEqual(self.target.read_bytes(), expected)
+
+    def test_existing_two_domain_preset_gains_only_missing_entries_and_is_repeatable(self):
+        original = b'# My routing\ngemini.google.com\n# Existing API choice\ngenerativelanguage.googleapis.com\ncustom.example\n'
+        self.target.write_bytes(original)
+        self.assertEqual(config.prepare_gemini(self.target, self.metadata), 45)
+        config.apply_gemini(self.target, self.metadata)
+        expected = original + ('\n'.join(DOMAINS[2:]) + '\n').encode()
+        self.assertEqual(self.target.read_bytes(), expected)
+        self.metadata.unlink()
+        self.assertEqual(config.prepare_gemini(self.target, self.metadata), 0)
+        config.apply_gemini(self.target, self.metadata)
+        self.assertEqual(self.target.read_bytes(), expected)
 
     def test_crlf_and_missing_final_newline_survive_exact_rollback(self):
         for original in (b'# Windows list\r\ncustom.example\r\n', b'# no final newline'):
@@ -215,8 +281,19 @@ class GeminiLifecycleTests(unittest.TestCase):
         result = self.run_command('preset_command gemini; preset_command gemini')
         self.assertEqual(result.process.returncode, 0, result.output)
         self.assertTrue(result.include.startswith(self.original_include))
-        self.assertEqual(result.include.decode().splitlines().count(DOMAINS[0]), 1)
-        self.assertEqual(result.include.decode().splitlines().count(DOMAINS[1]), 1)
+        for domain in DOMAINS:
+            self.assertEqual(result.include.decode().splitlines().count(domain), 1)
+        self.assertEqual(result.exclude, self.original_exclude)
+        self.assertEqual(result.setup, self.original_setup)
+        self.assertEqual(result.state, result.before_state)
+        self.assertEqual(result.events, ['PARSE'])
+        self.assertEqual(result.temporary, [])
+
+    def test_existing_two_domain_client_preset_upgrades_without_reinstalling(self):
+        original = b'# Existing Gemini choices\ngemini.google.com\ngenerativelanguage.googleapis.com\ncustom.example\n'
+        result = self.run_command('preset_command gemini; preset_command gemini', includes=original)
+        self.assertEqual(result.process.returncode, 0, result.output)
+        self.assertEqual(result.include, original + ('\n'.join(DOMAINS[2:]) + '\n').encode())
         self.assertEqual(result.exclude, self.original_exclude)
         self.assertEqual(result.setup, self.original_setup)
         self.assertEqual(result.state, result.before_state)
@@ -263,7 +340,7 @@ class GeminiLifecycleTests(unittest.TestCase):
         result = self.run_command('client_install --bundle "$TEST_BUNDLE" --gemini', installed=False)
         self.assertEqual(result.process.returncode, 0, result.output)
         self.assertTrue(result.include.startswith(self.original_include))
-        self.assertEqual(result.include.decode().splitlines()[-2:], list(DOMAINS))
+        self.assertEqual(result.include.decode().splitlines()[-len(DOMAINS):], list(DOMAINS))
         self.assertNotIn('gemini.before.json', result.state)
         self.assertTrue(result.exclude.startswith(self.original_exclude))
         self.assertEqual(result.events.count('PARSE'), 1)
