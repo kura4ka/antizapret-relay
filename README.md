@@ -439,10 +439,6 @@ bash install.sh client --bundle /root/antizapret-relay-import.json
 bash install.sh client --bundle /root/antizapret-relay-import.json --gemini
 ```
 
-## Совместимость
-
-Совместимость исходников проверена с обновлением AntiZapret [`314f5a1`](https://github.com/GubernievS/AntiZapret-VPN/commit/314f5a105bca9111ed2ab62a782f497ac0bbeeec): fake IP перешли на nftables, при этом используемые Relay параметры WARP, интерфейсы и таблицы маршрутизации сохранены.
-
-Подробности устройства проекта, технические ограничения и проверенный upstream-коммит описаны в [документе по архитектуре](docs/architecture.md).
+Подробности устройства проекта и технические ограничения описаны в [документе по архитектуре](docs/architecture.md).
 
 Автоматические проверки проекта: [GitHub Actions](https://github.com/kura4ka/antizapret-relay/actions).
