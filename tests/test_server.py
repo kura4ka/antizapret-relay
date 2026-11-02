@@ -130,7 +130,10 @@ printf 'mock donor bundle\n' > "$SERVER_BUNDLE"
 declare -A mock_rules=() mock_chains=()
 client_guard='filter|FORWARD|-s 10.29.0.0/16 -m mark --mark 0x2 ! -o warp-antizapret -m comment --comment az-relay-client -j DROP'
 mock_rules[$client_guard]=1
+MOCK_FW_STATE=$STATE_DIR/firewall-state.sh
+declare -p mock_rules mock_chains > "$MOCK_FW_STATE"
 require_root() { :; }
+firewall_lock() { :; }
 die() { printf '%s\n' "$*" >&2; exit 1; }
 log() { :; }
 server_load_state() {
@@ -143,31 +146,36 @@ server_load_state() {
 ip() { return 0; }
 iptables() {
     local table=filter op chain key rule
+    source "$MOCK_FW_STATE"
     [[ $1 != -w ]] || shift
     if [[ $1 == -t ]]; then table=$2; shift 2; fi
     op=$1; chain=$2; shift 2
     [[ $op != -I || ${1:-} != 1 ]] || shift
     key="$table|$chain|$*"
     case $op in
-        -C) [[ -n ${mock_rules[$key]+yes} ]] ;;
+        -C) [[ -n ${mock_rules[$key]+yes} ]]; return ;;
         -D) unset 'mock_rules[$key]' ;;
         -A|-I) mock_rules[$key]=1 ;;
         -N) mock_chains["$table|$chain"]=1 ;;
-        -S) [[ -n ${mock_chains["$table|$chain"]+yes} ]] ;;
+        -S) [[ -n ${mock_chains["$table|$chain"]+yes} ]]; return ;;
         -F) for rule in "${!mock_rules[@]}"; do
                 if [[ $rule == "$table|$chain|"* ]]; then unset 'mock_rules[$rule]'; fi
             done ;;
         -X) unset 'mock_chains[$table|$chain]' ;;
         *) die "Unexpected iptables operation: $op" ;;
     esac
+    declare -p mock_rules mock_chains > "$MOCK_FW_STATE"
 }
 server_firewall up
+source "$MOCK_FW_STATE"
 count_first=${#mock_rules[@]}
 for rule in "${!mock_rules[@]}"; do printf '%s\n' "$rule"; done
 printf 'FIRST_COUNT=%s\n' "$count_first"
 server_firewall up
+source "$MOCK_FW_STATE"
 [[ ${#mock_rules[@]} == "$count_first" ]] || die 'Duplicate firewall rules after reinstall'
 server_firewall down
+source "$MOCK_FW_STATE"
 [[ ${#mock_rules[@]} == 1 && -n ${mock_rules[$client_guard]+yes} ]] || die 'Donor teardown removed the client guard or left donor rules'
 [[ ${#mock_chains[@]} == 0 ]] || die 'Firewall chains left behind'
 # Exercise donor removal on a combined host. Absolute installation paths are
@@ -191,6 +199,7 @@ rm() {
 }
 server_firewall up
 server_uninstall
+source "$MOCK_FW_STATE"
 [[ ${#mock_rules[@]} == 1 && -n ${mock_rules[$client_guard]+yes} ]] || die 'Donor uninstall removed client guard'
 [[ ! -f $STATE_DIR/server.conf && ! -f $WG_CONF ]] || die 'Donor metadata left behind'
 [[ ! -f $SERVER_BUNDLE ]] || die 'Donor export left behind'

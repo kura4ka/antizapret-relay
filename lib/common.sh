@@ -2,7 +2,7 @@
 # This file is compiled into install.sh by tools/build.py.
 set -Eeuo pipefail
 umask 077
-VERSION=0.3.3
+VERSION=0.3.4
 STATE_DIR=/etc/antizapret-relay
 APP=/usr/local/sbin/antizapret-relay
 WG_IF=az-relay
@@ -70,4 +70,10 @@ ipt_del() {
     while iptables -w -t "$table" -C "$chain" "$@" 2>/dev/null; do
         iptables -w -t "$table" -D "$chain" "$@"
     done
+}
+firewall_lock() {
+    # Native service and WireGuard hooks may run together. Keep this lock
+    # separate from the installer lock, which is held across service restarts.
+    exec 8>"${FIREWALL_LOCK_FILE:-/run/lock/antizapret-relay-firewall.lock}"
+    flock -x 8
 }

@@ -48,8 +48,8 @@ Native exclusions also apply; list shows only this additional file:
   antizapret-relay domain remove example.com
   antizapret-relay domain list
 
-Upgrade an existing installation (first default-exclusion migration briefly
-reconnects WARP; keys and addresses are preserved):
+Upgrade an existing installation (keys and addresses are preserved;
+client guards are reapplied without restarting AntiZapret):
   bash install.sh upgrade
 HELP
 }
@@ -119,7 +119,7 @@ relay_main() {
     esac
     require_root
     require_commands flock
-    exec 9>/run/lock/antizapret-relay.lock
+    exec 9>"${OPERATION_LOCK_FILE:-/run/lock/antizapret-relay.lock}"
     # Firewall is also called synchronously by systemd while install holds fd 9.
     if [[ $command_name != firewall ]]; then flock -n 9 || die 'Another relay operation is running.'; fi
     case "$command_name" in
@@ -137,6 +137,7 @@ relay_main() {
             install_dependencies
             install_self
             client_upgrade_exclusions
+            if [[ -f $STATE_DIR/client.conf ]]; then client_firewall up; fi
             log 'Installer and firewall hooks upgraded. Existing keys and tunnel addresses are kept.'
             ;;
         *) usage >&2; die "Unknown command: $command_name" ;;

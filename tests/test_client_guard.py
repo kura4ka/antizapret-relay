@@ -24,30 +24,37 @@ source "$COMMON_SOURCE"
 source "$CLIENT_SOURCE"
 STATE_DIR=$TEST_STATE
 declare -A mock_rules=()
+firewall_lock() { :; }
 stat() { printf '0\n'; }
 iptables() {
-    local table=filter op chain key
+    [[ ! -f $RULE_DUMP ]] || source "$RULE_DUMP"
+    local table=filter op chain key status=0
     [[ $1 != -w ]] || shift
     if [[ $1 == -t ]]; then table=$2; shift 2; fi
     op=$1; chain=$2; shift 2
     [[ $op != -I || ${1:-} != 1 ]] || shift
     key="$table|$chain|$*"
     case $op in
-        -C) [[ -n ${mock_rules[$key]+yes} ]] ;;
+        -C) [[ -n ${mock_rules[$key]+yes} ]] || status=$? ;;
         -I) mock_rules[$key]=$(( ${mock_rules[$key]:-0} + 1 )) ;;
         -D) unset 'mock_rules[$key]' ;;
         *) die "Unexpected iptables operation: $op" ;;
     esac
+    declare -p mock_rules | sed 's/declare -A/declare -gA/' > "$RULE_DUMP"
+    return "$status"
 }
 client_firewall up
+source "$RULE_DUMP"
 for rule in "${!mock_rules[@]}"; do printf '%s\n' "$rule"; done
 first_count=${#mock_rules[@]}
 client_firewall up
+source "$RULE_DUMP"
 [[ ${#mock_rules[@]} == "$first_count" ]] || die 'Duplicate rule keys'
 for rule in "${!mock_rules[@]}"; do
     [[ ${mock_rules[$rule]} == 1 ]] || die 'Duplicate rule insertion'
 done
 client_firewall down
+source "$RULE_DUMP"
 [[ ${#mock_rules[@]} == 0 ]] || die 'Rules left behind'
 printf 'CLEANED\n'
 '''
@@ -56,6 +63,7 @@ printf 'CLEANED\n'
                     "COMMON_SOURCE": (ROOT / "lib/common.sh").as_posix(),
                     "CLIENT_SOURCE": (ROOT / "lib/client.sh").as_posix(),
                     "TEST_STATE": state.as_posix(),
+                    "RULE_DUMP": (state / "rules.sh").as_posix(),
                 }, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 rules = result.stdout.splitlines()
@@ -106,22 +114,26 @@ CLIENT_DOMAINS=$TEST_CLIENT_DOMAINS
 declare -A mock_rules=()
 donor_rule='filter|FORWARD|-i az-relay -m comment --comment az-relay-forward -j AZRELAY-FWD'
 mock_rules[$donor_rule]=1
-trap 'declare -p mock_rules > "$RULE_DUMP"' EXIT
+declare -p mock_rules | sed 's/declare -A/declare -gA/' > "$RULE_DUMP"
+firewall_lock() { :; }
 stat() { printf '0\n'; }
 config_tool() { "$PYTHON_EXE" "$CONFIG_SOURCE" "$@"; }
 iptables() {
-    local table=filter op chain key
+    source "$RULE_DUMP"
+    local table=filter op chain key status=0
     [[ $1 != -w ]] || shift
     if [[ $1 == -t ]]; then table=$2; shift 2; fi
     op=$1; chain=$2; shift 2
     [[ $op != -I || ${1:-} != 1 ]] || shift
     key="$table|$chain|$*"
     case $op in
-        -C) [[ -n ${mock_rules[$key]+yes} ]] ;;
+        -C) [[ -n ${mock_rules[$key]+yes} ]] || status=$? ;;
         -I) mock_rules[$key]=1 ;;
         -D) unset 'mock_rules[$key]' ;;
         *) die "Unexpected iptables operation: $op" ;;
     esac
+    declare -p mock_rules | sed 's/declare -A/declare -gA/' > "$RULE_DUMP"
+    return "$status"
 }
 systemctl() {
     if [[ $1 == start ]]; then

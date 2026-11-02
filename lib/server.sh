@@ -22,11 +22,12 @@ server_iptables_remove() {
     done
 }
 
-server_firewall() {
+server_firewall() (
     require_root
     local action=${1:-}
     [[ $action == up || $action == down ]] || die 'Usage: firewall up|down'
     [[ -f "$STATE_DIR/server.conf" ]] || return 0
+    firewall_lock
     server_load_state
 
     # Keep tunnel traffic closed while rebuilding our chains. If any command
@@ -108,7 +109,7 @@ server_firewall() {
     server_iptables_remove filter INPUT -i "$WG_IF" -m comment --comment az-relay-rebuild-INPUT-in -j DROP
     server_iptables_remove filter FORWARD -i "$WG_IF" -m comment --comment az-relay-rebuild-FORWARD-in -j DROP
     server_iptables_remove filter FORWARD -o "$WG_IF" -m comment --comment az-relay-rebuild-FORWARD-out -j DROP
-}
+)
 
 server_validate_subnet() {
     python3 - "$1" <<'PY'
