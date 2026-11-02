@@ -35,11 +35,39 @@ bash install.sh
 
 Укажите публичный IPv4 донора и его SSH-порт (обычно `22`). Установщик подключится к донору по SSH и получит настройки WireGuard. Для этого нужен root-доступ по SSH.
 
-Если SSH-доступа нет, файл подключения можно заранее передать на клиентский VPS вручную: `antizapret-relay-donor.json` с донора нужно скопировать как `/root/antizapret-relay-import.json`, а затем запустить установку командой:
+Если SSH-доступа нет, перенесите файл подключения вручную — инструкция ниже.
 
-```bash
-bash install.sh client --bundle /root/antizapret-relay-import.json
-```
+### Ручная передача файла подключения
+
+Этот способ нужен, если клиентский VPS не может подключиться к донору по SSH.
+
+1. **На доноре** файл подключения находится здесь:
+
+   ```text
+   /root/antizapret-relay-donor.json
+   ```
+
+2. **С донора** скопируйте его на клиентский VPS. Замените `CLIENT_IP` на публичный IP клиента:
+
+   ```bash
+   scp /root/antizapret-relay-donor.json root@CLIENT_IP:/root/antizapret-relay-import.json
+   ```
+
+   Если у клиента SSH работает на нестандартном порту, например `2222`:
+
+   ```bash
+   scp -P 2222 /root/antizapret-relay-donor.json root@CLIENT_IP:/root/antizapret-relay-import.json
+   ```
+
+3. **На клиенте** запустите установку с полученным файлом:
+
+   ```bash
+   bash install.sh client --bundle /root/antizapret-relay-import.json
+   ```
+
+Итого: источник — `/root/antizapret-relay-donor.json` на доноре, назначение — `/root/antizapret-relay-import.json` на клиенте.
+
+Файл содержит приватные ключи. Передавайте его только по защищённому каналу и не публикуйте.
 
 ### Both — обе роли
 
